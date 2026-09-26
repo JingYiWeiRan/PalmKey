@@ -1,0 +1,19 @@
+# ---- Gradle / Android ----
+*.iml
+.gradle/
+build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# ---- IDE / 本地工具数据（与项目源码无关，且含本机路径/会话数据） ----
+.idea/
+.agents/
+.lingma/
+.workbuddy/
+PLUGIN_MANAGER_QUICKSTART.md
+
+# ---- C++ / Qt (server) ----
+*.user

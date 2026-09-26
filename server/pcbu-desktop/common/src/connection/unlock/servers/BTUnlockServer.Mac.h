@@ -1,0 +1,16 @@
+#ifndef PCBU_DESKTOP_BTUNLOCKSERVER_MAC_H
+#define PCBU_DESKTOP_BTUNLOCKSERVER_MAC_H
+
+#include "connection/unlock/BaseUnlockConnection.h"
+
+class BTUnlockServer : public BaseUnlockConnection {
+public:
+  explicit BTUnlockServer(const PairedDevice &device);
+
+  bool Start() override;
+  void Stop() override;
+
+private:
+};
+
+#endif // PCBU_DESKTOP_BTUNLOCKSERVER_MAC_H

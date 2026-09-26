@@ -1,0 +1,26 @@
+#ifndef PCBU_DESKTOP_BTUNLOCKSERVER_H
+#define PCBU_DESKTOP_BTUNLOCKSERVER_H
+#ifdef APPLE
+#include "BTUnlockServer.Mac.h"
+#else
+
+#include "connection/unlock/BaseUnlockConnection.h"
+
+class BTUnlockServer : public BaseUnlockConnection {
+public:
+  explicit BTUnlockServer(const PairedDevice &device);
+
+  bool Start() override;
+  void Stop() override;
+
+private:
+  void AcceptThread();
+  void ClientThread(SOCKET clientSocket);
+
+  SOCKET m_ServerSocket;
+  std::vector<SOCKET> m_ClientSockets{};
+  std::vector<std::thread> m_ClientThreads{};
+};
+
+#endif
+#endif // PCBU_DESKTOP_BTUNLOCKSERVER_H

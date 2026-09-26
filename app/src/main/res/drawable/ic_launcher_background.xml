@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用图标背景：与 App 深色主题一致的双色渐变（#1B1E21 → #0E1012）。
+     前景的「指纹+钥匙」图形是亮红渐变，压在深底上对比最清晰，小尺寸也可辨。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#1B1E21"
+        android:endColor="#0E1012"
+        android:type="linear" />
+</shape>
