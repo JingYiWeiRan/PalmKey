@@ -17,7 +17,7 @@
 ## 构建
 
 ```bash
-git clone https://github.com/<you>/PalmKey.git
+git clone https://github.com/JingYiWeiRan/PalmKey.git
 cd PalmKey
 ./gradlew :app:assembleDebug
 ```
