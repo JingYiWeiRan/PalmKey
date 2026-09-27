@@ -16,6 +16,8 @@
 
 ## 构建
 
+需要 JDK 17；Windows 下把 `./gradlew` 换成 `gradlew.bat`。
+
 ```bash
 git clone https://github.com/JingYiWeiRan/PalmKey.git
 cd PalmKey
@@ -23,7 +25,13 @@ cd PalmKey
 ```
 
 - minSdk 28 / targetSdk 36 / Kotlin 2.0 / Jetpack Compose (Material 3)
-- 图标等设计源文件在 `app/design/icon/`，可用其中的脚本重新生成
+- 应用图标的源图形与生成脚本在 `app/design/icon/`——脚本里写死的是作者本机的绝对路径，换机器使用前需先修改脚本顶部的 `SRC` / `RES` / `OUT` 三个常量
+
+## 使用前提
+
+- 电脑端安装上游 [PC Bio Unlock](https://github.com/MeisApps/pcbu-desktop) 桌面端
+- 打开 App，扫码或手动输入完成配对；解锁通过 UDP 广播自动发现或蓝牙
+- 想要「免点击直接弹指纹」的体验，请按 App 内引导开启悬浮窗、后台弹出界面、自启动等权限（vivo / 小米等国产 ROM 必开）
 
 ## 仓库结构
 
