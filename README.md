@@ -2,7 +2,7 @@
 
 > 用手机的指纹，解锁你的电脑。
 
-「掌钥」是开源项目 [PC Bio Unlock](https://github.com/MeisApps/pcbu-desktop) 的 **Android 客户端独立实现**。上游项目只提供 Windows / macOS / Linux 桌面端，没有官方 Android App，本仓库补齐了这一环：手机与电脑配对后，靠近电脑即可用指纹验证直接解锁。
+「掌钥」是开源项目 [PC Bio Unlock](https://github.com/MeisApps/pcbu-desktop) 的 **Android 客户端开源实现**。上游项目提供 Windows / macOS / Linux 桌面端，也有官方移动端 App，但**未开源**、且在国内难以获取；本仓库补上了一个开源的 Android 端：手机与电脑配对后，靠近电脑即可用指纹验证直接解锁。
 
 ## 功能
 
