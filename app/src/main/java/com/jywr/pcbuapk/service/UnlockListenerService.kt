@@ -359,8 +359,12 @@ class UnlockListenerService : Service() {
             return START_NOT_STICKY
         }
 
-        startUdpListening()
-        startBluetoothListening()
+        // 用 ensureListenersRunning() 而不是分别调两个 start：
+        // 它会先做状态自检（服务标记在监听、监听器其实已停 → 复位后重建），
+        // 而两个 start 各自的闸门在"成功过一次"之后就永远挡回后续调用。
+        // 这里是最重要的重建触发点之一：MainActivity 每次启动、蓝牙重新开启、
+        // 保活链拉起服务，都会走到这一行。
+        ensureListenersRunning()
         registerNetworkCallback()
         startKeepAlive()
 
@@ -421,6 +425,19 @@ class UnlockListenerService : Service() {
             Log.w(TAG, "UDP 监听状态不一致（服务标记在监听、监听器已停止），复位后重建")
             isUdpListening = false
             udpStarting.set(false)
+        }
+
+        // 蓝牙这一路必须做同样的自检，而且它比 UDP 更容易踩：
+        // - startListening() 只是起一个线程就返回，所以 isBtListening = true 是**乐观赋值**，
+        //   线程随后因蓝牙关闭 / RFCOMM 创建失败而死掉时，这个标记不会自己变假；
+        // - btStarting 在成功后**永不复位**，于是 startBluetoothListening() 从第二次起就是空操作；
+        // 两者叠加 = 一旦蓝牙 accept 线程死掉，没有任何路径能重建它 → 同样静默失聪。
+        // 而本品在国产 ROM 上的真实链路恰恰走蓝牙（电脑端日志里是 `Connecting via BT...`），
+        // 所以这条路不能只靠 UDP 的修复兜着。
+        if (isBtListening && !bluetoothServer.isRunning()) {
+            Log.w(TAG, "蓝牙监听状态不一致（服务标记在监听、监听器已停止），复位后重建")
+            isBtListening = false
+            btStarting.set(false)
         }
 
         startUdpListening()

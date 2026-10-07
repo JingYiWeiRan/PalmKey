@@ -29,12 +29,31 @@ class BluetoothServer {
         
         // Packet协议常量
         private const val PACKET_ID_UNLOCK_RESPONSE = 0xB2
+
+        /**
+         * accept 持续失败时的退避时间。
+         *
+         * 没有它会形成一个 100% 占 CPU 的忙循环并刷日志洪水：`accept()` 抛异常后
+         * catch 只是打日志就 continue，下一轮立刻再抛。蓝牙被系统关闭、RFCOMM 服务记录
+         * 失效、适配器复位都会走到这里 —— 而这些恰恰是长时间运行后最常见的情况。
+         */
+        private const val ACCEPT_RETRY_BACKOFF_MS = 500L
     }
     
     private var serverSocket: BluetoothServerSocket? = null
     private var clientSocket: android.bluetooth.BluetoothSocket? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
+
+    /**
+     * 监听意图 + 线程实际存活状态，两者都由 accept 线程写、由服务读，必须跨线程可见。
+     *
+     * 关键语义：accept 线程**退出时一定会把它置回 false**（见下面 finally）。
+     * 否则服务会以为"还在监听"，而 `startListening` 的 `if (isListening) return`
+     * 会让后续所有重建调用变成空操作 —— 也就是"端口看着在、其实没人接"的静默失聪，
+     * 与 UDP 那一路已经修过的问题同源。
+     */
+    @Volatile
     private var isListening = false
     private var listenerThread: Thread? = null
     
@@ -82,8 +101,17 @@ class BluetoothServer {
                 
                 while (isListening) {
                     try {
+                        // 取出本地引用：stopListening() 会把字段置空，
+                        // 若直接写 serverSocket?.accept()，置空后 accept 立刻返回 null，
+                        // 循环就会空转（100% CPU）。这里用本地引用并在为空时直接退出。
+                        val server = serverSocket
+                        if (server == null) {
+                            Log.i(TAG, "Server Socket 已释放，监听循环退出")
+                            break
+                        }
+
                         // 阻塞等待客户端连接
-                        val socket = serverSocket?.accept()
+                        val socket = server.accept()
                         
                         if (socket != null) {
                             val device = socket.remoteDevice
@@ -110,7 +138,14 @@ class BluetoothServer {
                         
                     } catch (e: Exception) {
                         if (isListening) {
-                            Log.e(TAG, "等待客户端连接失败", e)
+                            Log.e(TAG, "等待客户端连接失败（${ACCEPT_RETRY_BACKOFF_MS}ms 后重试）", e)
+                            // 退避，避免持续失败时空转刷日志
+                            try {
+                                Thread.sleep(ACCEPT_RETRY_BACKOFF_MS)
+                            } catch (interrupted: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                                break
+                            }
                         }
                     }
                 }
@@ -118,7 +153,17 @@ class BluetoothServer {
             } catch (e: Exception) {
                 Log.e(TAG, "启动蓝牙Server失败", e)
             } finally {
-                Log.d(TAG, "蓝牙Server监听线程退出")
+                // 线程退出时必须把状态复位：否则服务以为还在监听，而 startListening 的
+                // `if (isListening) return` 会让重建调用全部变成空操作 → 静默失聪。
+                // 与 UDP 接收循环退出时释放 socket 并复位状态的修复保持对称。
+                val unexpected = isListening
+                isListening = false
+                listenerThread = null
+                if (unexpected) {
+                    Log.w(TAG, "⚠️ 蓝牙Server监听线程意外退出，状态已复位（等待重建）")
+                } else {
+                    Log.d(TAG, "蓝牙Server监听线程退出")
+                }
             }
         }
         
