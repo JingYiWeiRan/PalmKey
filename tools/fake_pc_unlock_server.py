@@ -42,6 +42,7 @@ import json
 import os
 import random
 import socket
+import string
 import struct
 import sys
 import time
@@ -49,10 +50,13 @@ import time
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 MAGIC = 0xDB065AC7AFDFA4CC
+ID_PAIR_INIT = 0x50
+ID_PAIR_RESPONSE = 0x51
 ID_DEVICE_ID = 0xB0
 ID_UNLOCK_REQUEST = 0xB1
 ID_UNLOCK_RESPONSE = 0xB2
 
+PAIRING_PROTOCOL_VERSION = "3.0.0"  # upstream AppInfo::GetPairingProtocolVersion()
 DEFAULT_PORT = 43296  # upstream AppSettings default for unlockServerPort
 PBKDF2_ITERATIONS = 65535
 IV_LEN = 16
@@ -111,12 +115,109 @@ def decrypt_packet(blob: bytes, password: str) -> bytes:
     return plain[8:]
 
 
+def handle_pairing(conn: socket.socket, payload: bytes, key: str, port: int) -> None:
+    """PAIR_INIT -> PAIR_RESPONSE.
+
+    Mirrors upstream `common/src/connection/pairing/PairingServer.cpp` (lines 150-190):
+    the request is an encrypted `PacketPairInit`, the reply an encrypted `PacketPairResponse`
+    whose `data` carries deviceId / deviceName / userName / passwordKey / pairingMethod / port.
+
+    Note on the encryption shape: unlike the unlock flow (which wraps the ciphertext in a
+    JSON field `encData` as hex), the pairing flow puts the RAW envelope straight into the
+    packet payload. The app decrypts `response.second` directly, so this must not hex-wrap it.
+
+    Upstream derives `deviceId = Sha256(machineID + deviceUUID + userName)` on the PC side.
+    A stand-in has no such machine identity, so it returns a fixed id from
+    `PCBU_PAIR_DEVICE_ID` -- which is also what makes this useful: it can reproduce a
+    specific pairing (and therefore a specific device id) on demand.
+    """
+    init = json.loads(decrypt_packet(payload, key).decode("utf-8"))
+    note(init.get("protoVersion") == PAIRING_PROTOCOL_VERSION,
+         f"PAIR_INIT protoVersion = {init.get('protoVersion')!r} "
+         f"(expected {PAIRING_PROTOCOL_VERSION!r})")
+    note(bool(init.get("deviceUUID")), "PAIR_INIT carries a deviceUUID")
+    print(f"  pair request: deviceName={init.get('deviceName')!r} udpPort={init.get('udpPort')}", flush=True)
+
+    device_id = os.environ.get("PCBU_PAIR_DEVICE_ID", "").strip()
+    if not device_id:
+        note(False, "PCBU_PAIR_DEVICE_ID is not set - cannot decide the device id to return")
+        return
+
+    # upstream hands out a fresh random 64-char password key per pairing
+    password_key = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(64))
+    response = {
+        "data": {
+            "deviceId": device_id,
+            "deviceName": os.environ.get("PCBU_PAIR_DEVICE_NAME", "FAKE-PC"),
+            "deviceOS": "Linux",
+            "ipAddress": "127.0.0.1",
+            "port": port,
+            # "UDP" so the app routes later unlocks through the TCP unlock server
+            # (PairingMethods.usesTcpServer). A bluetooth pairing would never come back here.
+            "pairingMethod": "UDP",
+            "macAddress": "",
+            "userName": os.environ.get("PCBU_PAIR_USER_NAME", "test"),
+            "passwordKey": password_key,
+        }
+    }
+    write_packet(conn, ID_PAIR_RESPONSE, encrypt_packet(json.dumps(response).encode("utf-8"), key))
+    note(True, f"sent PAIR_RESPONSE for device id {device_id}")
+
+
+def handle_unlock(conn: socket.socket, packet_id: int, payload: bytes, key: str,
+                  device_id_expected: str, token: str) -> None:
+    """DEVICE_ID -> UNLOCK_REQUEST -> UNLOCK_RESPONSE (the original flow)."""
+    # 1. phone sends the plaintext device id
+    note(packet_id == ID_DEVICE_ID,
+         f"DEVICE_ID packet id = 0x{packet_id:04X} (expected 0x{ID_DEVICE_ID:04X})")
+    got_id = payload.decode("utf-8", "replace")
+    note(got_id == device_id_expected,
+         f"DEVICE_ID payload is the PLAINTEXT device id (got {got_id!r})")
+    # No "looks encrypted" heuristic: the device id is itself a 64-char hex digest,
+    # so such a heuristic fires on the correct payload. The exact match above is the test.
+
+    # 2. PC sends the unlock request carrying a PC-generated token
+    inner = json.dumps({"user": "test", "program": "", "unlockToken": token})
+    request = json.dumps({
+        "protoVersion": "3.0.0",
+        "deviceId": device_id_expected,
+        "encData": encrypt_packet(inner.encode("utf-8"), key).hex().upper(),
+    })
+    write_packet(conn, ID_UNLOCK_REQUEST, request.encode("utf-8"))
+    print("sent UNLOCK_REQUEST with a PC-generated token", flush=True)
+
+    # 3. phone replies with the echoed token
+    packet_id, payload = read_packet(conn)
+    note(packet_id == ID_UNLOCK_RESPONSE,
+         f"UNLOCK_RESPONSE packet id = 0x{packet_id:04X} (expected 0x{ID_UNLOCK_RESPONSE:04X})")
+
+    response = json.loads(payload.decode("utf-8"))
+    note(response.get("error", "") == "",
+         f"response error field is empty (got {response.get('error')!r})")
+
+    enc_hex = response.get("encData", "")
+    note(bool(enc_hex), "response carries encData")
+    if enc_hex:
+        data = json.loads(decrypt_packet(bytes.fromhex(enc_hex), key).decode("utf-8"))
+        note(data.get("unlockToken") == token,
+             "echoed unlockToken matches the token the PC generated")
+        note("passwordKey" in data,
+             "passwordKey present (upstream requires the key to exist)")
+
+
 def main() -> int:
     key = os.environ.get("PCBU_ENCRYPTION_KEY", "").strip()
     device_id_expected = os.environ.get("PCBU_DEVICE_ID", "").strip()
-    if not key or not device_id_expected:
+    if not key:
         print(__doc__)
-        print("ERROR: set PCBU_ENCRYPTION_KEY and PCBU_DEVICE_ID", flush=True)
+        print("ERROR: set PCBU_ENCRYPTION_KEY", flush=True)
+        return 2
+    # 配对流程由 PCBU_PAIR_DEVICE_ID 决定回什么设备 ID，不需要 PCBU_DEVICE_ID；
+    # 解锁流程才必须知道期望的设备 ID（用来校验手机发来的是明文 device id）。
+    if not device_id_expected and not os.environ.get("PCBU_PAIR_DEVICE_ID", "").strip():
+        print(__doc__)
+        print("ERROR: set PCBU_DEVICE_ID (unlock flow) or PCBU_PAIR_DEVICE_ID (pairing flow)",
+              flush=True)
         return 2
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
@@ -124,7 +225,14 @@ def main() -> int:
                     for _ in range(64))
 
     print(f"fake TCPUnlockServer listening on 0.0.0.0:{port}", flush=True)
-    print(f"expecting device id {device_id_expected}", flush=True)
+    # 按配置说清楚这个实例能服务哪个流程：只配了 PCBU_DEVICE_ID 就只认解锁，
+    # 只配了 PCBU_PAIR_DEVICE_ID 就只认配对。以前无条件打印 "expecting device id"，
+    # 配对模式下那行是空的，会让人以为配置没生效。
+    if device_id_expected:
+        print(f"unlock flow: expecting device id {device_id_expected}", flush=True)
+    pair_dev_id = os.environ.get("PCBU_PAIR_DEVICE_ID", "").strip()
+    if pair_dev_id:
+        print(f"pairing flow: will hand out device id {pair_dev_id}", flush=True)
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -144,43 +252,17 @@ def main() -> int:
     print(f"connection from {peer[0]}:{peer[1]}", flush=True)
 
     try:
-        # 1. phone sends the plaintext device id
-        packet_id, payload = read_packet(conn)
-        note(packet_id == ID_DEVICE_ID,
-             f"DEVICE_ID packet id = 0x{packet_id:04X} (expected 0x{ID_DEVICE_ID:04X})")
-        got_id = payload.decode("utf-8", "replace")
-        note(got_id == device_id_expected,
-             f"DEVICE_ID payload is the PLAINTEXT device id (got {got_id!r})")
-        # No "looks encrypted" heuristic: the device id is itself a 64-char hex digest,
-        # so such a heuristic fires on the correct payload. The exact match above is the test.
-
-        # 2. PC sends the unlock request carrying a PC-generated token
-        inner = json.dumps({"user": "test", "program": "", "unlockToken": token})
-        request = json.dumps({
-            "protoVersion": "3.0.0",
-            "deviceId": device_id_expected,
-            "encData": encrypt_packet(inner.encode("utf-8"), key).hex().upper(),
-        })
-        write_packet(conn, ID_UNLOCK_REQUEST, request.encode("utf-8"))
-        print("sent UNLOCK_REQUEST with a PC-generated token", flush=True)
-
-        # 3. phone replies with the echoed token
-        packet_id, payload = read_packet(conn)
-        note(packet_id == ID_UNLOCK_RESPONSE,
-             f"UNLOCK_RESPONSE packet id = 0x{packet_id:04X} (expected 0x{ID_UNLOCK_RESPONSE:04X})")
-
-        response = json.loads(payload.decode("utf-8"))
-        note(response.get("error", "") == "",
-             f"response error field is empty (got {response.get('error')!r})")
-
-        enc_hex = response.get("encData", "")
-        note(bool(enc_hex), "response carries encData")
-        if enc_hex:
-            data = json.loads(decrypt_packet(bytes.fromhex(enc_hex), key).decode("utf-8"))
-            note(data.get("unlockToken") == token,
-                 "echoed unlockToken matches the token the PC generated")
-            note("passwordKey" in data,
-                 "passwordKey present (upstream requires the key to exist)")
+        # The first packet tells us which flow this connection is:
+        #   PAIR_INIT (0x50) -> pairing, then the app closes
+        #   DEVICE_ID (0xB0) -> unlock handshake
+        first_id, first_payload = read_packet(conn)
+        if first_id == ID_PAIR_INIT:
+            handle_pairing(conn, first_payload, key, port)
+        elif first_id == ID_DEVICE_ID:
+            handle_unlock(conn, first_id, first_payload, key, device_id_expected, token)
+        else:
+            note(False, f"unexpected first packet id 0x{first_id:04X} "
+                        f"(expected PAIR_INIT 0x50 or DEVICE_ID 0xB0)")
     except Exception as exc:  # noqa: BLE001 - surface anything unexpected
         note(False, f"exception during handshake: {type(exc).__name__}: {exc}")
     finally:
