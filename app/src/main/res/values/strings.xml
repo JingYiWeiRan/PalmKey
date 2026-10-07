@@ -1,42 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+    本应用**只提供中文**，文案直接写在 Compose 代码里，不走 strings.xml。
+
+    为什么删掉这里原来的 42 条（2026 审查结论）：它们全部是**死资源** ——
+    整个工程只有 AndroidManifest 的 android:label 引用了 app_name，
+    其余 41 条在 Kotlin 里零引用（代码用的是硬编码中文字面量）。
+    保留一堆永远不会被读取的翻译条目，只会让人误以为"这个 App 已经做了本地化"，
+    并在改动文案时误导人去改错地方。
+
+    决策记录：目标用户是国内的 vivo / 小米 / OPPO 机型用户（见 README 的适配说明），
+    单语言是产品定位而不是疏漏，因此不做多语言，也不保留悬空的资源。
+
+    ⚠️ 若将来确实要支持多语言，不能只把字面量搬进这里：service 层目前把
+    中文错误消息当作返回值一路送到 snackbar（如 UnlockService.unlock 返回 String?），
+    而 ui/components/ToastPill.kt 还靠中文关键字（contains("失败") 等）判断图标与颜色。
+    正确的落地顺序是先把「字符串结果」重构为「错误类型」，再由 UI 层映射到资源。
+-->
 <resources>
+    <!-- 仅用于 AndroidManifest 的 android:label -->
     <string name="app_name">掌钥</string>
-    <string name="add_device">添加设备</string>
-    <string name="settings">设置</string>
-    <string name="unlock">解锁</string>
-    <string name="delete">删除</string>
-    <string name="no_devices">暂无配对设备</string>
-    <string name="tap_to_add">点击右下角按钮添加电脑</string>
-    <string name="scanning_qr">请扫描电脑端显示的二维码</string>
-    <string name="pair_bluetooth">先配对蓝牙设备</string>
-    <string name="simulating_scan">模拟扫码（测试用）</string>
-    <string name="pairing">正在配对...</string>
-    <string name="pair_success">配对成功！</string>
-    <string name="pair_failed">配对失败</string>
-    <string name="retry">重试</string>
-    <string name="done">完成</string>
-    <string name="biometric_auth">生物识别验证</string>
-    <string name="biometric_subtitle">验证您的身份以解锁电脑</string>
-    <string name="unlock_pc">解锁电脑</string>
-    <string name="biometric_failed">生物识别失败</string>
-    <string name="unlock_success">解锁成功</string>
-    <string name="auto_detect">自动检测设备</string>
-    <string name="auto_detect_desc">当靠近电脑时自动弹出通知</string>
-    <string name="quick_verify">通知栏快捷验证</string>
-    <string name="quick_verify_desc">关闭后点击通知将进入App再验证</string>
-    <string name="udp_port">UDP 监听端口</string>
-    <string name="about">关于</string>
-    <string name="version">版本 1.0.0</string>
-    <string name="user">用户</string>
-    <string name="connection_method">连接方式</string>
-    <string name="ip_address">IP</string>
-    <string name="last_connected">最后连接</string>
-    <string name="just_now">刚刚</string>
-    <string name="minutes_ago">分钟前</string>
-    <string name="hours_ago">小时前</string>
-    <string name="days_ago">天前</string>
-    <string name="device_detected">检测到电脑</string>
-    <string name="device_found_msg">发现设备: %s，点击解锁</string>
-    <string name="unlock_now">立即解锁</string>
-    <string name="error">错误</string>
-    <string name="confirm">确认</string>
 </resources>

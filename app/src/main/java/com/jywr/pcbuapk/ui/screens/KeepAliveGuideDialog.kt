@@ -129,7 +129,7 @@ fun KeepAliveGuideDialog(onDismiss: () -> Unit) {
                     },
                     granted = batteryGranted
                 ) {
-                    KeepAliveManager.requestIgnoreBatteryOptimizations(context)
+                    KeepAliveManager.openBatteryOptimizationSettings(context)
                 }
 
                 GuideItem(

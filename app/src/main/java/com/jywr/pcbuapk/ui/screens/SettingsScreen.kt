@@ -1,6 +1,7 @@
 package com.jywr.pcbuapk.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -54,11 +55,27 @@ fun SettingsScreen(
     var batteryGranted by remember {
         mutableStateOf(KeepAliveManager.isIgnoringBatteryOptimizations(context))
     }
+    // 精确闹钟本来就是可查询的（canScheduleExactAlarms），之前却硬编码成 null，
+    // 于是无论用户开没开都显示"去设置" —— 属于实打实的显示错误，这里接上真实状态。
+    var exactAlarmGranted by remember {
+        mutableStateOf(KeepAliveManager.canScheduleExactAlarms(context))
+    }
+
+    // 「后台弹出界面 / 锁屏显示」「自启动 / 后台运行」是国产 ROM 私有开关，
+    // **没有公开 API 可查**，所以只能由用户手动确认并持久化。
+    var backgroundPopupConfirmed by remember {
+        mutableStateOf(KeepAliveManager.isRomPermissionConfirmed(context, KeepAliveManager.ROM_PERM_BACKGROUND_POPUP))
+    }
+    var autoStartConfirmed by remember {
+        mutableStateOf(KeepAliveManager.isRomPermissionConfirmed(context, KeepAliveManager.ROM_PERM_AUTOSTART))
+    }
+
     LaunchedEffect(Unit) {
         while (true) {
             overlayGranted = KeepAliveManager.canDrawOverlays(context)
             fullScreenGranted = KeepAliveManager.canUseFullScreenIntent(context)
             batteryGranted = KeepAliveManager.isIgnoringBatteryOptimizations(context)
+            exactAlarmGranted = KeepAliveManager.canScheduleExactAlarms(context)
             delay(1500L)
         }
     }
@@ -109,11 +126,26 @@ fun SettingsScreen(
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
+                        // 三种模式只影响「多久自检/重启一次服务」。
+                        //
+                        // 旧文案写「省电模式…息屏可能收不到请求」——那是当时的真实行为
+                        // （省电模式会放弃常驻唤醒锁），但也正是「选了省电模式就再也解不开
+                        // 电脑」这个坑的来源。唤醒锁现在无条件持有，所以不再与模式联动。
+                        //
+                        // 同时也不能反过来声称「息屏解锁不受影响」：实测本机（vivo /
+                        // Android 15）屏幕一熄系统就冻结进程，那是「自启动 / 后台运行」
+                        // 那一项决定的。这里如实说明各自的归属。
                         text = when (preferences.keepAliveMode) {
-                            0 -> "省电模式：30 分钟检查一次，息屏可能收不到请求"
-                            2 -> "可靠模式：5 分钟检查一次，响应最及时"
-                            else -> "平衡模式：15 分钟检查一次（推荐）"
+                            0 -> "省电模式：30 分钟自检一次（最省电，被系统回收后恢复最慢）"
+                            2 -> "可靠模式：5 分钟自检一次（最不容易被系统回收）"
+                            else -> "平衡模式：15 分钟自检一次（推荐）"
                         },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "以上仅影响自检频率；息屏能否收到解锁请求由下面的「自启动 / 后台运行」决定。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -163,15 +195,37 @@ fun SettingsScreen(
                 PermissionRow(
                     title = "后台弹出界面 / 锁屏显示",
                     description = "国产 ROM 的独立开关，不开则桌面和锁屏下弹不出界面",
-                    granted = null
+                    granted = null,
+                    manualConfirmed = backgroundPopupConfirmed,
+                    onManualConfirmChange = { confirmed ->
+                        backgroundPopupConfirmed = confirmed
+                        KeepAliveManager.setRomPermissionConfirmed(
+                            context, KeepAliveManager.ROM_PERM_BACKGROUND_POPUP, confirmed
+                        )
+                    }
                 ) { KeepAliveManager.openBackgroundPopupSettings(context) }
 
                 RowDivider()
 
                 PermissionRow(
+                    // 这一项**直接决定息屏解锁能不能用**：实测（vivo / Android 15）
+                    // 屏幕一熄系统就把本应用放进 freezer（cgroup.freeze=1），
+                    // 并强制禁用它的唤醒锁，于是 UDP 报文只能堆在内核队列里、
+                    // 直到点亮屏幕才被处理。放行「自启动 / 后台运行」才会解冻。
+                    // 原先的描述只说「自动恢复服务」，完全没提示这个后果。
                     title = "自启动 / 后台运行",
-                    description = "开机或被清理后台后能自动恢复服务",
-                    granted = null
+                    // 注意：Compose 的 Text **不解析 Markdown**，这里不能写 **粗体**，
+                    // 否则界面上会原样显示出星号（真机上已经出现过这个问题）。
+                    // 需要强调就靠措辞，而不是标记。
+                    description = "决定息屏能否解锁：未放行时系统会冻结本应用，息屏后收不到解锁请求",
+                    granted = null,
+                    manualConfirmed = autoStartConfirmed,
+                    onManualConfirmChange = { confirmed ->
+                        autoStartConfirmed = confirmed
+                        KeepAliveManager.setRomPermissionConfirmed(
+                            context, KeepAliveManager.ROM_PERM_AUTOSTART, confirmed
+                        )
+                    }
                 ) { KeepAliveManager.openAutoStartSettings(context) }
 
                 RowDivider()
@@ -180,7 +234,7 @@ fun SettingsScreen(
                     title = "电池优化白名单",
                     description = if (batteryGranted) "已在白名单中" else "防止休眠后服务被回收",
                     granted = batteryGranted
-                ) { KeepAliveManager.requestIgnoreBatteryOptimizations(context) }
+                ) { KeepAliveManager.openBatteryOptimizationSettings(context) }
 
                 RowDivider()
 
@@ -198,8 +252,12 @@ fun SettingsScreen(
 
                 PermissionRow(
                     title = "精确闹钟",
-                    description = "保活心跳使用；未授权时会自动降级，精度下降",
-                    granted = null
+                    description = if (exactAlarmGranted) {
+                        "已授权，保活心跳使用精确闹钟"
+                    } else {
+                        "未授权，保活心跳会自动降级为非精确，精度下降"
+                    },
+                    granted = exactAlarmGranted
                 ) { KeepAliveManager.openExactAlarmSettings(context) }
             }
 
@@ -352,20 +410,35 @@ private fun UdpPortRow(
  * 需要跳系统设置页去开启的权限项。
  *
  * @param granted true=已开启（对勾，主色），false=未开启（感叹号，错误色），null=无法直接检测
+ * @param manualConfirmed 仅用于**系统不提供查询接口**的 ROM 权限（如 vivo 的自启动）：
+ *   非空表示交给用户手动确认，值为当前是否已确认。
+ *   不这样做的话，那一行会永远显示成「需要开启」—— 用户明明开了也会被反复要求去开。
+ * @param onManualConfirmChange 用户点「标记为已开启 / 取消标记」时的回调
  */
 @Composable
 private fun PermissionRow(
     title: String,
     description: String,
     granted: Boolean?,
+    manualConfirmed: Boolean? = null,
+    onManualConfirmChange: ((Boolean) -> Unit)? = null,
+    // onClick 必须留在最后：调用处用的是尾随 lambda 写法 `PermissionRow(...) { ... }`，
+    // 一旦它后面还有参数，lambda 就会绑到别的参数上（编译直接报 No value passed for onClick）。
     onClick: () -> Unit
 ) {
-    val statusColor: Color = when (granted) {
+    // 手动确认过的无法检测项，按"已开启"呈现：用户已经明确告诉我们他开好了
+    val effectiveGranted: Boolean? = when {
+        granted != null -> granted
+        manualConfirmed == true -> true
+        else -> null
+    }
+
+    val statusColor: Color = when (effectiveGranted) {
         true -> MaterialTheme.colorScheme.secondary
         false -> MaterialTheme.colorScheme.error
         null -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val statusIcon = when (granted) {
+    val statusIcon = when (effectiveGranted) {
         true -> Icons.Default.CheckCircle
         false -> Icons.Default.Warning
         null -> Icons.Default.Info
@@ -390,15 +463,39 @@ private fun PermissionRow(
             Text(
                 text = description,
                 style = MaterialTheme.typography.bodySmall,
-                color = if (granted == false) {
+                color = if (effectiveGranted == false) {
                     MaterialTheme.colorScheme.error
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
                 }
             )
+            // 无法查询的权限：给出「手动确认」入口，让界面能反映真实情况
+            if (manualConfirmed != null && onManualConfirmChange != null) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = if (manualConfirmed) {
+                        "系统不提供查询接口 · 已标记为开启（点此取消）"
+                    } else {
+                        "系统不提供查询接口 · 开好后点此标记为已开启"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable {
+                        onManualConfirmChange(!manualConfirmed)
+                    }
+                )
+            }
         }
         TextButton(onClick = onClick) {
-            Text(if (granted == true) "已开启" else "去开启")
+            Text(
+                when (effectiveGranted) {
+                    true -> if (granted == null) "已确认" else "已开启"
+                    false -> "去开启"
+                    // null = 无法检测：这里只能表示"去设置页看一下"这个动作，
+                    // 不能写"去开启"—— 那会被读成"当前没开"。真机上就发生过这种误判。
+                    null -> "去设置"
+                }
+            )
         }
     }
 }

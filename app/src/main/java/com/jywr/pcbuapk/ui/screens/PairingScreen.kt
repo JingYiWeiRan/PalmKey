@@ -40,6 +40,7 @@ import com.google.zxing.integration.android.IntentIntegrator
 import com.jywr.pcbuapk.service.QrCodeData
 import com.jywr.pcbuapk.ui.activity.PortraitCaptureActivity
 import com.jywr.pcbuapk.ui.viewmodel.PairingViewModel
+import com.jywr.pcbuapk.utils.PairingInputValidator
 
 private const val TAG = "PairingScreen"
 
@@ -272,14 +273,27 @@ fun PairingScreen(
                             encKey = encKey,
                             onEncKeyChange = { encKey = it },
                             onPairClick = {
-                                val portNum = port.toIntOrNull()
-                                if (portNum == null) {
-                                    viewModel.setErrorMessage("端口号格式错误")
+                                // 复用 PairingInputValidator（与单元测试同一份实现）。
+                                // 原先这里只判 toIntOrNull()，端口 0、负数、99999 都能通过并真的发起配对。
+                                if (!PairingInputValidator.isValidIpAddress(ipAddress)) {
+                                    viewModel.setErrorMessage("请输入合法的 IPv4 地址，例如 192.168.1.100")
+                                    return@ManualPairingForm
+                                }
+                                if (!PairingInputValidator.isValidPort(port)) {
+                                    viewModel.setErrorMessage(
+                                        "端口号需在 ${PairingInputValidator.MIN_PORT}-${PairingInputValidator.MAX_PORT} 之间"
+                                    )
+                                    return@ManualPairingForm
+                                }
+                                if (!PairingInputValidator.isValidEncryptionKey(encKey)) {
+                                    viewModel.setErrorMessage(
+                                        "加密密钥至少 ${PairingInputValidator.MIN_ENCRYPTION_KEY_LENGTH} 个字符"
+                                    )
                                     return@ManualPairingForm
                                 }
                                 viewModel.startPairing(
                                     ip = ipAddress,
-                                    port = portNum,
+                                    port = port.toInt(),
                                     encKey = encKey,
                                     deviceName = android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL,
                                     udpPort = udpListenPort
@@ -529,7 +543,7 @@ fun ManualPairingForm(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(48.dp),
-                enabled = ipAddress.isNotBlank() && port.isNotBlank() && encKey.isNotBlank()
+                enabled = PairingInputValidator.isFormValid(ipAddress, port, encKey)
             ) {
                 Text("开始配对", style = MaterialTheme.typography.titleSmall)
             }

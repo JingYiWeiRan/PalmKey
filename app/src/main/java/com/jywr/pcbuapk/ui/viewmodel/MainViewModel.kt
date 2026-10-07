@@ -71,8 +71,10 @@ class MainViewModel @Inject constructor(
     
     /**
      * 蓝牙解锁（通过已建立的连接发送响应）
+     *
      * @param deviceId 设备 ID
-     * @param unlockToken 解锁令牌（由生物识别生成）
+     * @param unlockToken 生物识别生成的本地令牌。协议要求回显的是 PC 下发的 token，
+     *   故该值不进入报文体；它只表达「人证核验已通过」这一前置条件。
      * @param callback 解锁结果回调（null 表示成功，否则为错误消息）
      */
     fun unlockBluetoothWithToken(deviceId: String, unlockToken: String, callback: (String?) -> Unit) {
@@ -84,17 +86,19 @@ class MainViewModel @Inject constructor(
                     callback("设备不存在")
                     return@launch
                 }
-                
+
                 // 通过静态引用访问 UnlockListenerService
                 val service = com.jywr.pcbuapk.service.UnlockListenerService.instance
                 if (service != null) {
-                    // 调用 Service 的方法发送蓝牙响应
-                    service.sendBluetoothResponse(unlockToken, device)
-                    callback(null) // 成功
+                    // 结果必须如实回传给界面。
+                    // sendBluetoothResponse 会等待 PC 的 unlockToken（最多 TOKEN_WAIT_TIMEOUT_MS），
+                    // 并返回 null 或失败原因；早先它返回 Unit 且内部吞掉全部失败，
+                    // 导致这里无论实际成败都报「解锁成功」。
+                    callback(service.sendBluetoothResponse(device))
                 } else {
                     callback("解锁服务未运行\n请确保应用正在后台运行")
                 }
-                
+
             } catch (e: Exception) {
                 callback("蓝牙解锁失败: ${e.message}")
             }

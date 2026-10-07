@@ -1,11 +1,19 @@
 package com.jywr.pcbuapk
 
+import com.jywr.pcbuapk.utils.PairingInputValidator
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.Assert.*
 
 /**
- * 测试手动输入配对功能的输入验证逻辑
- * 这些测试验证用户在手动输入配对时的表单验证规则
+ * 测试手动输入配对功能的输入验证逻辑。
+ *
+ * ⚠️ 这些用例原先测的是本文件内自己声明的一份 `private fun isValidIpAddress/...` 副本，
+ * 生产代码里根本没有同名实现 —— 于是测试全绿却对发布代码零保护，
+ * 界面实际只判 `isNotBlank()`，连 `"99999"` 端口都会照发。
+ *
+ * 现在断言的是 [PairingInputValidator]，也就是 PairingScreen 真正引用的那一份。
+ * 任何生产校验被放宽/删除，这里都会立刻变红。
  */
 class ManualInputValidationTest {
 
@@ -20,7 +28,7 @@ class ManualInputValidationTest {
         )
 
         validIps.forEach { ip ->
-            assertTrue("IP '$ip' should be valid", isValidIpAddress(ip))
+            assertTrue("IP '$ip' should be valid", PairingInputValidator.isValidIpAddress(ip))
         }
     }
 
@@ -37,7 +45,7 @@ class ManualInputValidationTest {
         )
 
         invalidIps.forEach { ip ->
-            assertFalse("IP '$ip' should be invalid", isValidIpAddress(ip))
+            assertFalse("IP '$ip' should be invalid", PairingInputValidator.isValidIpAddress(ip))
         }
     }
 
@@ -52,7 +60,7 @@ class ManualInputValidationTest {
         )
 
         validPorts.forEach { port ->
-            assertTrue("Port '$port' should be valid", isValidPort(port))
+            assertTrue("Port '$port' should be valid", PairingInputValidator.isValidPort(port))
         }
     }
 
@@ -70,7 +78,7 @@ class ManualInputValidationTest {
         )
 
         invalidPorts.forEach { port ->
-            assertFalse("Port '$port' should be invalid", isValidPort(port))
+            assertFalse("Port '$port' should be invalid", PairingInputValidator.isValidPort(port))
         }
     }
 
@@ -85,7 +93,7 @@ class ManualInputValidationTest {
         )
 
         validKeys.forEach { key ->
-            assertTrue("Key '$key' should be valid", isValidEncryptionKey(key))
+            assertTrue("Key '$key' should be valid", PairingInputValidator.isValidEncryptionKey(key))
         }
     }
 
@@ -99,82 +107,48 @@ class ManualInputValidationTest {
         )
 
         invalidKeys.forEach { key ->
-            assertFalse("Key '$key' should be invalid", isValidEncryptionKey(key))
+            assertFalse("Key '$key' should be invalid", PairingInputValidator.isValidEncryptionKey(key))
         }
     }
 
     @Test
     fun `complete form validation - all fields valid`() {
-        val ip = "192.168.1.100"
-        val port = "8080"
-        val encKey = "mySecretKey123"
-
-        val isFormValid = isValidIpAddress(ip) && isValidPort(port) && isValidEncryptionKey(encKey)
-
-        assertTrue("Complete form with valid data should pass validation", isFormValid)
+        assertTrue(
+            "Complete form with valid data should pass validation",
+            PairingInputValidator.isFormValid("192.168.1.100", "8080", "mySecretKey123")
+        )
     }
 
     @Test
     fun `complete form validation - missing IP`() {
-        val ip = ""
-        val port = "8080"
-        val encKey = "mySecretKey123"
-
-        val isFormValid = isValidIpAddress(ip) && isValidPort(port) && isValidEncryptionKey(encKey)
-
-        assertFalse("Form with missing IP should fail validation", isFormValid)
+        assertFalse(
+            "Form with missing IP should fail validation",
+            PairingInputValidator.isFormValid("", "8080", "mySecretKey123")
+        )
     }
 
     @Test
     fun `complete form validation - invalid port`() {
-        val ip = "192.168.1.100"
-        val port = "99999"
-        val encKey = "mySecretKey123"
-
-        val isFormValid = isValidIpAddress(ip) && isValidPort(port) && isValidEncryptionKey(encKey)
-
-        assertFalse("Form with invalid port should fail validation", isFormValid)
+        assertFalse(
+            "Form with invalid port should fail validation",
+            PairingInputValidator.isFormValid("192.168.1.100", "99999", "mySecretKey123")
+        )
     }
 
     @Test
     fun `complete form validation - empty encryption key`() {
-        val ip = "192.168.1.100"
-        val port = "8080"
-        val encKey = ""
-
-        val isFormValid = isValidIpAddress(ip) && isValidPort(port) && isValidEncryptionKey(encKey)
-
-        assertFalse("Form with empty encryption key should fail validation", isFormValid)
+        assertFalse(
+            "Form with empty encryption key should fail validation",
+            PairingInputValidator.isFormValid("192.168.1.100", "8080", "")
+        )
     }
 
-    /**
-     * IP地址验证函数
-     */
-    private fun isValidIpAddress(ip: String): Boolean {
-        if (ip.isBlank()) return false
-        
-        val parts = ip.split(".")
-        if (parts.size != 4) return false
-        
-        return parts.all { part ->
-            part.toIntOrNull()?.let { it in 0..255 } ?: false
-        }
-    }
-
-    /**
-     * 端口号验证函数
-     */
-    private fun isValidPort(port: String): Boolean {
-        if (port.isBlank()) return false
-        
-        val portNum = port.toIntOrNull() ?: return false
-        return portNum in 1..65535
-    }
-
-    /**
-     * 加密密钥验证函数
-     */
-    private fun isValidEncryptionKey(key: String): Boolean {
-        return key.isNotBlank() && key.length >= 3
+    /** 端口下界与上界必须真的被拦住（原先生产只判 toIntOrNull，0 会被放行） */
+    @Test
+    fun `port boundaries are enforced`() {
+        assertFalse(PairingInputValidator.isValidPort("0"))
+        assertTrue(PairingInputValidator.isValidPort("1"))
+        assertTrue(PairingInputValidator.isValidPort("65535"))
+        assertFalse(PairingInputValidator.isValidPort("65536"))
     }
 }

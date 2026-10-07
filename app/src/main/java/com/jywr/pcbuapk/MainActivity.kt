@@ -18,12 +18,14 @@ import androidx.fragment.app.FragmentActivity
 import com.jywr.pcbuapk.navigation.AppNavigation
 import com.jywr.pcbuapk.service.UnlockListenerService
 import com.jywr.pcbuapk.ui.theme.PcbuTheme
-import com.jywr.pcbuapk.utils.KeepAliveManager
 import com.jywr.pcbuapk.utils.NotificationManager
 import dagger.hilt.android.AndroidEntryPoint
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 
 private const val TAG = "MainActivity"
 
@@ -40,25 +42,55 @@ private const val TAG = "MainActivity"
 class UnlockRequest(
     val deviceId: String,
     val deviceName: String,
-    val mode: Int = UnlockListenerService.MODE_PROMPT
+    val mode: Int = UnlockListenerService.MODE_PROMPT,
+    /**
+     * 本次请求的唯一标识。
+     *
+     * 用途是**幂等**：投递到界面后，「弹指纹 → 回发解锁响应」这段逻辑由
+     * `viewModelScope` 执行，不受承载它的 `LaunchedEffect` 取消影响。
+     * 而实测（vivo / Android 15）从设置页切回主页时，该 effect 会**以同一个 key
+     * 重新启动一次**，于是同一个请求被派发两次、给电脑回了两条响应。
+     * 用这个 id 把「同一请求只处理一次」的保证放到不随组合重建而丢失的地方。
+     */
+    val id: String = java.util.UUID.randomUUID().toString()
 )
 
 @AndroidEntryPoint
 class MainActivity : FragmentActivity() {
 
     companion object {
-        /**
-         * 待处理的解锁请求。
-         *
-         * 用 StateFlow 而不是普通静态变量：Activity 已在前台时点击通知/全屏 Intent
-         * 只会回调 onNewIntent，普通变量赋值不会触发 Compose 重组，
-         * 生物识别弹窗就不会出现。
-         */
-        private val _pendingUnlock = MutableStateFlow<UnlockRequest?>(null)
-        val pendingUnlock: StateFlow<UnlockRequest?> = _pendingUnlock.asStateFlow()
+        /** 待处理解锁请求的缓冲深度，够覆盖一次连续重试即可 */
+        private const val PENDING_UNLOCK_CAPACITY = 8
 
-        fun consumeUnlock() {
-            _pendingUnlock.value = null
+        /**
+         * 待处理的解锁请求队列。
+         *
+         * 为什么用 Channel 而不是原来的 StateFlow：
+         * 验证界面挂在 `main` 目的地里，只有它被组合时才有人在收集。原来用
+         * `MutableStateFlow<UnlockRequest?>` 有两个后果：
+         * 1. 用户停在「设置 / 配对」页时到达的请求**没有任何人处理**（会被静默丢弃）；
+         * 2. 连续两次请求会互相**覆盖**，只剩最后一条。
+         * Channel 会缓存并按序**逐个投递、恰好消费一次**，晚到的收集者也能拿到排队中的请求。
+         */
+        private val _pendingUnlock = Channel<UnlockRequest>(PENDING_UNLOCK_CAPACITY)
+        val pendingUnlock: Flow<UnlockRequest> = _pendingUnlock.receiveAsFlow()
+
+        /**
+         * 「请把界面切回主页」信号。
+         *
+         * 解锁请求可能在任何页面到达，而验证界面在主页。不主动切回去的话，
+         * 请求只能一直排队等用户自己返回 —— 而电脑端早就超时了。
+         */
+        private val _navigateHome = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+        val navigateHome: SharedFlow<Unit> = _navigateHome.asSharedFlow()
+
+        /** 投递一次解锁请求，并把界面带回主页 */
+        private fun requestUnlock(request: UnlockRequest) {
+            val queued = _pendingUnlock.trySend(request).isSuccess
+            if (!queued) {
+                Log.w(TAG, "解锁请求队列已满，丢弃本次请求: ${request.deviceName}")
+            }
+            _navigateHome.tryEmit(Unit)
         }
 
         /**
@@ -108,8 +140,9 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 创建通知渠道
-        NotificationManager.createNotificationChannel(this)
+        // 通知渠道由 UnlockListenerService 在 onCreate 里创建
+        // （pcbu_service / pcbu_unlock_request）。这里原先还会创建第三个
+        // 渠道 pcbu_channel，但它没有任何发送方，只会在系统通知设置里留下无用条目，已移除。
 
         // 来自解锁请求时需要能盖在锁屏之上并点亮屏幕
         applyLockScreenFlags()
@@ -204,8 +237,12 @@ class MainActivity : FragmentActivity() {
     private fun startUnlockListenerService() {
         Log.i(TAG, "启动解锁监听服务")
 
-        // 检查并请求电池优化白名单
-        KeepAliveManager.requestIgnoreBatteryOptimizations(this)
+        // 这里原先会在每次冷启动时主动跳转「忽略电池优化」授权页。
+        // 已移除，两个原因：
+        // 1. 那个 action 需要 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 权限，属 Play 政策风险项；
+        // 2. 每次启动都把用户甩到系统设置页本身也很打扰。
+        // 电池优化状态改由 KeepAliveGuideDialog（首次启动引导）与设置页的「权限与保活」
+        // 分区展示，用户点哪一项才跳哪一页。
 
         val serviceIntent = Intent(this, UnlockListenerService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -239,7 +276,7 @@ class MainActivity : FragmentActivity() {
                 Log.w(TAG, "撤销解锁通知失败", e)
             }
 
-            _pendingUnlock.value = UnlockRequest(deviceId, deviceName, mode)
+            requestUnlock(UnlockRequest(deviceId, deviceName, mode))
         }
     }
 }
