@@ -15,6 +15,10 @@ captures/
 .workbuddy/
 PLUGIN_MANAGER_QUICKSTART.md
 
+# AI 会话工作数据：本机路径、会话记忆与截图产物，绝不能入库
+.deepseek-harness/
+.dsh-vision-router/
+
 # ---- C++ / Qt (server) ----
 *.user
 

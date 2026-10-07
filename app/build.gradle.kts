@@ -63,12 +63,37 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests {
+            // CryptoUtils / UnlockProtocol / PacketCodec 会调用 android.util.Log，
+            // 纯 JVM 单测里未处理的 android.* 方法默认抛 "not mocked" 异常。
+            // 打开后返回默认值，于是可以对**真实生产代码**做加解密往返与协议编解码测试，
+            // 而不必再像 ManualInputValidationTest 那样自己抄一份实现来测。
+            isReturnDefaultValues = true
+        }
+    }
+}
+
+// Room schema 导出目录：AppDatabase 已开 exportSchema，
+// 把生成的 schema JSON 纳入版本控制后，后续迁移才有可比对的基线。
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.appcompat)
+
+    // ⚠️ material 不能删。它的 Compose 组件一个都没用到，但它提供了
+    // res/values/themes.xml 里的父样式 Theme.Material3.DayNight.NoActionBar
+    // （Manifest 的 android:theme）。删掉会直接编译失败：
+    // "resource style/Theme.Material3.DayNight.NoActionBar not found"。
     implementation(libs.material)
+
+    // MainActivity 继承 FragmentActivity（BiometricPrompt 的前置要求）。
+    // 该类虽然也会经 material / zxing-android-embedded 传递进来，
+    // 但直接用到的 API 应显式声明，不该依赖间接传递。
+    implementation(libs.androidx.appcompat)
+
     
     // Compose
     implementation(platform(libs.androidx.compose.bom))
@@ -97,12 +122,9 @@ dependencies {
     // QR Code
     implementation(libs.zxing.core)
     implementation(libs.zxing.android.embedded)
-    
-    // Crypto
-    implementation(libs.androidx.security.crypto)
-    
-    // WorkManager
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // WorkManager（保活兜底）
+    implementation(libs.androidx.work.runtime.ktx)
     
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

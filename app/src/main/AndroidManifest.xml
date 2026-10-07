@@ -34,10 +34,15 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!--
-        电池优化白名单：跳转系统「忽略电池优化」授权页必须声明该权限，
-        否则 ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 会直接抛 SecurityException。
+        电池优化白名单。
+
+        ⚠️ 这里**不再**声明 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS。
+        它只用于 ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 那个「一键加白」弹窗，
+        而 Google Play 对该权限的用途有明确限制（闹钟/VoIP/companion 等特定类别），
+        指纹解锁工具类应用申请它属于典型驳回理由。
+        改为引导用户到系统「电池优化」列表页自行设置：
+        ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS 不需要任何权限，也没有政策风险。
     -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- 全屏通知：锁屏/桌面直接弹出验证界面（Android 14+ 需用户在系统设置中手动授权） -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
@@ -61,9 +66,18 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     
-    <!-- 精确闹钟权限（Android 12+） -->
+    <!--
+        精确闹钟权限（Android 12+）。
+
+        只声明 SCHEDULE_EXACT_ALARM：它是用户可授予/可撤销的，配合
+        KeepAliveManager.canScheduleExactAlarms() 判断 + setAndAllowWhileIdle 降级即可。
+
+        ⚠️ 不要加 USE_EXACT_ALARM：Google Play 只允许闹钟/日历类应用使用它，
+        本应用的真实需求只是保活心跳，属于典型驳回理由；而且它在 Android 14+ 是
+        安装即授予、用户不可撤销，会让 canScheduleExactAlarms() 恒为 true，
+        悄悄把一个需要用户同意的授权变成不受限的授权。
+    -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <application
         android:name=".PcbuApplication"
@@ -157,13 +171,23 @@
             </intent-filter>
         </receiver>
         
-        <!-- 服务重启广播接收器（监听屏幕点亮、用户解锁；网络变化改由动态回调处理） -->
+        <!--
+            服务重启广播接收器。
+
+            ⚠️ 只注册 USER_PRESENT，**不要**注册 SCREEN_ON：
+            ACTION_SCREEN_ON 属于「只能动态注册接收」的系统广播，
+            平台不会把它投递给静态注册的接收器 —— 写在这里等于一条死配置，
+            原先那行从来没有生效过，却让人以为"屏幕点亮时会自动拉起服务"。
+
+            而且即便改成动态注册也达不到原意：接收器要在服务**已经死掉**时
+            把服务拉起来，而动态注册随进程一起消失。这条需求实际由
+            AlarmManager 保活链 + START_STICKY + BootReceiver 承担。
+        -->
         <receiver
             android:name=".receiver.ServiceRestartReceiver"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
-                <action android:name="android.intent.action.SCREEN_ON" />
                 <action android:name="android.intent.action.USER_PRESENT" />
             </intent-filter>
         </receiver>
