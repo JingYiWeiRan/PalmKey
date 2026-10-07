@@ -79,11 +79,14 @@ class UserPreferences(private val context: Context) {
         // 详见 KeepAliveManager.getKeepAliveMode。
         KeepAliveManager.setKeepAliveMode(context, safeMode)
 
-        // 切到「不保活」时必须**当场**撤销已经排上的续命链（闹钟 + WorkManager）。
-        // 不能只依赖服务启动时的判断：startKeepAlive() 每个服务实例只跑一次，
-        // 用户改模式时它不会再执行，那条会自我续期的闹钟会继续把服务拉起来 ——
-        // 与「清掉就死透」直接冲突。真机上验证过这个缺口。
-        if (!KeepAlivePolicy.shouldArmKeepAlive(safeMode)) {
+        // 模式变化必须**立刻**作用到保活链，不能等到"下次服务启动"：
+        //   - 切到「不保活」：当场撤销已排的闹钟与 WorkManager。否则那条会自我续期的
+        //     闹钟仍会把服务拉起来，与「清掉就死透」直接冲突（真机复现过）。
+        //   - 切回常规模式：叫服务重新评估，否则保活链永远不再建立 ——
+        //     真机实测切回「平衡」后待触发闹钟为空，且没有任何报错，属于静默失效。
+        if (KeepAlivePolicy.shouldArmKeepAlive(safeMode)) {
+            KeepAliveManager.requestKeepAliveReconcile(context)
+        } else {
             KeepAliveManager.stopKeepAlive(context)
         }
     }

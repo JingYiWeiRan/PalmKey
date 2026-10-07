@@ -97,6 +97,17 @@ class UnlockListenerService : Service() {
         /** 解锁请求通知 ID；MainActivity 接住请求后需要撤销它，所以对外公开 */
         const val NOTIFICATION_ID_UNLOCK_REQUEST = 101
 
+        /**
+         * 要求服务按当前保活模式重新评估保活链（武装或撤销）。
+         *
+         * 为什么必须有这个显式信号：保活链只在 `startKeepAlive()` 里建立，而它只被
+         * `onStartCommand` 调用。用户在设置页切换模式时服务**不会**重启，于是：
+         *   - 切回常规模式 → 保活链永远不再建立（真机实测：待触发闹钟为空、且无任何报错）
+         *   - 切到不保活   → 旧闹钟留着（这一条由 UserPreferences 里那次当场撤销兜底）
+         * 所以模式变化必须主动叫服务重新评估，不能指望"下次服务启动"。
+         */
+        const val ACTION_RECONCILE_KEEP_ALIVE = "com.jywr.pcbuapk.action.RECONCILE_KEEP_ALIVE"
+
         /** 「请在锁屏上解锁」提示通知 ID（与指纹提醒分开，避免互相覆盖） */
         private const val NOTIFICATION_ID_UNLOCK_WAITING = 102
 
@@ -318,6 +329,18 @@ class UnlockListenerService : Service() {
             Log.i(TAG, "收到正常停止请求")
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (intent?.action == ACTION_RECONCILE_KEEP_ALIVE) {
+            // 作废"已武装"的记忆，强制按当前模式重新评估一次
+            armedKeepAliveMode = Int.MIN_VALUE
+            startKeepAlive()
+            Log.i(TAG, "收到保活重新评估请求，模式=${KeepAliveManager.getKeepAliveMode(this)}")
+            return if (KeepAlivePolicy.shouldBeSticky(KeepAliveManager.getKeepAliveMode(this))) {
+                START_STICKY
+            } else {
+                START_NOT_STICKY
+            }
         }
 
         if (intent?.action == ACTION_UNLOCK) {

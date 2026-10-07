@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.work.WorkManager
 import com.jywr.pcbuapk.receiver.KeepAliveReceiver
 import com.jywr.pcbuapk.service.KeepAlivePolicy
+import com.jywr.pcbuapk.service.UnlockListenerService
 
 /**
  * 保活管理器
@@ -179,6 +180,28 @@ object KeepAliveManager {
             Log.i(TAG, "保活周期任务已取消")
         } catch (e: Exception) {
             Log.w(TAG, "取消保活周期任务失败", e)
+        }
+    }
+
+    /**
+     * 通知服务按当前模式重新评估保活链（武装或撤销）。
+     *
+     * 用户从「不保活」切回常规模式时**必须**调用：保活链只在服务的 `startKeepAlive()` 里
+     * 建立，而它只被 `onStartCommand` 调用 —— 用户停在设置页时服务不会重启，于是保活链
+     * 永远不再建立。真机实测过：切回「平衡」后待触发闹钟为空，且没有任何报错，属于
+     * 很难发现的静默失效。
+     *
+     * 用 startForegroundService 而不是 startService：常规模式下服务本就该在跑，
+     * 顺手把它拉起来是对的；调用点都在应用前台（用户正在改设置），不受后台启动限制。
+     */
+    fun requestKeepAliveReconcile(context: Context) {
+        try {
+            val intent = Intent(context, UnlockListenerService::class.java).apply {
+                action = UnlockListenerService.ACTION_RECONCILE_KEEP_ALIVE
+            }
+            context.startForegroundService(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "请求重新评估保活链失败", e)
         }
     }
 
