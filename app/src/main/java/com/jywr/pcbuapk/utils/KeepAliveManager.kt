@@ -11,6 +11,9 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import androidx.work.WorkManager
+import com.jywr.pcbuapk.receiver.KeepAliveReceiver
+import com.jywr.pcbuapk.service.KeepAlivePolicy
 
 /**
  * 保活管理器
@@ -26,10 +29,20 @@ object KeepAliveManager {
     private const val PREFS_NAME = "pcbu_keepalive"
     private const val KEY_GUIDE_SHOWN = "keepalive_guide_shown_v1"
     private const val KEY_KEEP_ALIVE_INTERVAL = "keepalive_interval_ms"
+    private const val KEY_KEEP_ALIVE_MODE = "keepalive_mode"
     private const val KEY_ROM_PERMISSION_PREFIX = "rom_permission_confirmed_"
 
     /** 保活间隔默认值：15 分钟（与「平衡模式」一致） */
     const val DEFAULT_KEEP_ALIVE_INTERVAL_MS = 15 * 60 * 1000L
+
+    /**
+     * WorkManager 保活周期任务的唯一名字 / tag。
+     *
+     * 定义在这里而不是服务里，是为了让"取消"与"入队"用的是同一个值：
+     * 两边各写一份字面量的后果是取消静默失效（本项目就发生过 —— 清理用的 tag
+     * 与打标的 tag 不一致，清理一直是空操作）。
+     */
+    const val KEEP_ALIVE_WORK_TAG = "pcbu_keep_alive"
 
     // ---------------------------------------------------------------- 电池优化白名单
 
@@ -117,6 +130,55 @@ object KeepAliveManager {
         } catch (e: Exception) {
             Log.e(TAG, "设置保活闹钟失败", e)
             false
+        }
+    }
+
+    /**
+     * 取消保活闹钟链。
+     *
+     * 切到「不保活」模式时**必须**调用：闹钟链是自我续期的，已排的那一环到点照样会把
+     * 服务拉起来 —— 只"不再排新的"是不够的，用户会看到"清了后台过几分钟它又活了"。
+     *
+     * 这里的 PendingIntent 参数必须与三处武装点（服务 / KeepAliveReceiver / KeepAliveWorker）
+     * 完全一致（同一组件、同一 action、同一请求码），否则取消的是另一个 PendingIntent，
+     * 真正的闹钟依然留着。
+     */
+    fun cancelKeepAliveAlarm(context: Context) {
+        try {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val intent = Intent(context, KeepAliveReceiver::class.java).apply {
+                action = KeepAliveReceiver.ACTION_KEEP_ALIVE
+            }
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                KeepAliveReceiver.REQUEST_CODE_KEEP_ALIVE,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            alarmManager.cancel(pendingIntent)
+            pendingIntent.cancel()
+            Log.i(TAG, "保活闹钟已取消")
+        } catch (e: Exception) {
+            Log.w(TAG, "取消保活闹钟失败", e)
+        }
+    }
+
+    /**
+     * 停止**一切**主动续命手段：取消保活闹钟 + 取消 WorkManager 周期任务。
+     *
+     * 用户把模式切成「不保活」时必须**当场**调用。只在服务启动时判断是不够的：
+     * `startKeepAlive()` 每个服务实例只执行一次（有 `keepAliveArmed` 闸门），
+     * 用户改模式时它不会再跑，于是那条会自我续期的闹钟继续把服务拉起来。
+     * 真机上已复现过：切到「不保活」之后 `dumpsys alarm` 里 `ACTION_KEEP_ALIVE`
+     * 依然存在，而且刚被重新武装过一次。
+     */
+    fun stopKeepAlive(context: Context) {
+        cancelKeepAliveAlarm(context)
+        try {
+            WorkManager.getInstance(context).cancelUniqueWork(KEEP_ALIVE_WORK_TAG)
+            Log.i(TAG, "保活周期任务已取消")
+        } catch (e: Exception) {
+            Log.w(TAG, "取消保活周期任务失败", e)
         }
     }
 
@@ -265,6 +327,31 @@ object KeepAliveManager {
         // 防御历史/异常数据：间隔必须为正，否则闹钟会以过去时间触发形成忙循环
         return if (interval > 0) interval else DEFAULT_KEEP_ALIVE_INTERVAL_MS
     }
+
+    // ---------------------------------------------------------------- 保活模式的同步镜像
+    //
+    // 保活模式的正本在 DataStore（UserPreferences），但它只能异步读；而下面三处都必须
+    // **同步**拿到模式，否则无法在同一个调用里决定行为：
+    //   - UnlockListenerService.onStartCommand：决定返回 START_STICKY 还是 START_NOT_STICKY
+    //   - UnlockListenerService.onTaskRemoved：决定划掉任务后是停服还是继续跑
+    //   - BootReceiver.onReceive：决定开机要不要自启
+    // 所以在用户改动模式时同步写一份到 SharedPreferences 作为镜像。
+    //
+    // 镜像缺失时默认「平衡模式」是安全的：上面三处只区分「不保活」与「其余模式」，
+    // 而默认值不属于「不保活」，因此老版本升级上来的用户、以及从未改过模式的用户，
+    // 行为都与以前一致，不会因为镜像缺失而失能。
+
+    fun setKeepAliveMode(context: Context, mode: Int) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_KEEP_ALIVE_MODE, mode)
+            .apply()
+    }
+
+    /** @return 保活模式；未设置过时回退到「平衡模式」 */
+    fun getKeepAliveMode(context: Context): Int =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_KEEP_ALIVE_MODE, KeepAlivePolicy.MODE_BALANCED)
 
     // ---------------------------------------------------------------- 无法查询的 ROM 权限
     //

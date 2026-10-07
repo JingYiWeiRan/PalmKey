@@ -92,7 +92,7 @@ class UnlockListenerService : Service() {
          * （`enqueueUniquePeriodicWork`）与打标（`addTag`）三处一旦写岔，
          * 清理就会变成空操作 —— 这正是早先 tag 写成 `"keep_alive"` 时发生的事。
          */
-        const val KEEP_ALIVE_WORK_TAG = "pcbu_keep_alive"
+        const val KEEP_ALIVE_WORK_TAG = KeepAliveManager.KEEP_ALIVE_WORK_TAG
 
         /** 解锁请求通知 ID；MainActivity 接住请求后需要撤销它，所以对外公开 */
         const val NOTIFICATION_ID_UNLOCK_REQUEST = 101
@@ -170,10 +170,6 @@ class UnlockListenerService : Service() {
         @Volatile
         var instance: UnlockListenerService? = null
             private set
-
-        /** 标记是否正在正常停止（避免在 onDestroy 中重启） */
-        @Volatile
-        private var isNormalStop = false
     }
 
     @Inject
@@ -259,6 +255,16 @@ class UnlockListenerService : Service() {
     private var keepAliveArmed = false
 
     /**
+     * 已武装时采用的保活模式。
+     *
+     * 有了它，`startKeepAlive()` 的闸门从"武装过就永久跳过"变成"模式没变才跳过"：
+     * 用户把模式从「不保活」切回常规模式后，服务若还是直接 return，应用就再也没有
+     * 保活链了（而且不会有任何报错，只是再也不自检）—— 那是很难发现的静默失效。
+     */
+    @Volatile
+    private var armedKeepAliveMode: Int = Int.MIN_VALUE
+
+    /**
      * 已被证明「连不上」的设备 ID（端点可疑）。
      *
      * 只有在这个集合里的设备，才允许用 UDP 广播里的端点改写配对记录。
@@ -307,8 +313,9 @@ class UnlockListenerService : Service() {
         startForegroundService()
 
         if (intent?.action == ACTION_STOP) {
+            // "不要重启我"由返回值表达（START_NOT_STICKY），而不是靠一个标志位 ——
+            // 原先这里写 isNormalStop = true，但那个字段全项目只写不读，从未生效。
             Log.i(TAG, "收到正常停止请求")
-            isNormalStop = true
             stopSelf()
             return START_NOT_STICKY
         }
@@ -329,14 +336,19 @@ class UnlockListenerService : Service() {
             return START_NOT_STICKY
         }
 
-        isNormalStop = false
-
         startUdpListening()
         startBluetoothListening()
         registerNetworkCallback()
         startKeepAlive()
 
-        return START_STICKY
+        // 「不保活」模式下不能返回 START_STICKY：那等于告诉系统"进程被杀后请重建我"，
+        // 与「清掉就死透」直接冲突。模式从 SharedPreferences 同步读（DataStore 只能异步读）。
+        return if (KeepAlivePolicy.shouldBeSticky(KeepAliveManager.getKeepAliveMode(this))) {
+            START_STICKY
+        } else {
+            Log.i(TAG, "不保活模式：返回 START_NOT_STICKY，被系统杀死后不再重建")
+            START_NOT_STICKY
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -344,11 +356,21 @@ class UnlockListenerService : Service() {
     /**
      * 用户把应用从最近任务划掉时触发。
      *
-     * 服务本身配了 stopWithTask="false"，所以不会被一起停掉，
-     * 但国产 ROM 可能顺手把监听链路回收掉，这里显式确认它们在跑。
+     * 服务本身配了 stopWithTask="false"，所以默认不会被一起停掉；
+     * 常规模式下会显式确认监听链路仍在跑（国产 ROM 可能顺手回收它们）。
+     *
+     * 但「不保活」模式下这里必须**主动 stopSelf**：用户划掉应用就是在表达"别跑了"，
+     * 而只靠 stopWithTask="false" 会让服务继续活着 —— 那就违背了这个模式的全部意义。
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
+
+        if (!KeepAlivePolicy.shouldSurviveTaskRemoval(KeepAliveManager.getKeepAliveMode(this))) {
+            Log.i(TAG, "不保活模式：用户清掉最近任务，彻底停止服务")
+            stopSelf()
+            return
+        }
+
         Log.i(TAG, "任务被划掉，服务保持运行并确认监听链路")
         ensureListenersRunning()
     }
@@ -392,10 +414,16 @@ class UnlockListenerService : Service() {
         keyguardTimeoutJob?.cancel()
         releaseScreenWakeLock()
         releaseKeepAwakeLock()
-        // 注意：不要调用停止保活，让闹钟继续运行以重启服务
         serviceScope.cancel()
         Companion.instance = null
-        Log.i(TAG, "ℹ️ 服务已销毁，保活闹钟将继续运行")
+        // 这句日志会直接决定排查方向，所以必须按模式如实区分：
+        // 不保活模式下闹钟已被取消，如果还写"保活闹钟将继续运行"，
+        // 下次排查"为什么没自恢复"时就会被它带偏。
+        if (KeepAlivePolicy.shouldArmKeepAlive(KeepAliveManager.getKeepAliveMode(this))) {
+            Log.i(TAG, "ℹ️ 服务已销毁，保活闹钟将继续运行")
+        } else {
+            Log.i(TAG, "ℹ️ 服务已销毁（不保活模式：无闹钟续期，不会再被拉起）")
+        }
     }
 
     // ------------------------------------------------------------- 通知与前台服务
@@ -607,20 +635,39 @@ class UnlockListenerService : Service() {
      * 后续由 [KeepAliveReceiver] 自己续期（与这里共用同一个 PendingIntent，只有一条链）。
      */
     private fun startKeepAlive() {
-        if (keepAliveArmed) return
+        // 模式来自同步镜像（DataStore 只能异步读，而这里要同步决定"是否重新武装"）
+        val currentMode = KeepAliveManager.getKeepAliveMode(this)
+        // 模式没变才跳过；模式变了必须重新走一遍，否则：
+        //   切到「不保活」→ 旧闹钟留着（靠 UserPreferences 里那次当场撤销兜底）
+        //   切回常规模式  → 保活链永远不再建立（无人兜底，静默失效）
+        if (keepAliveArmed && armedKeepAliveMode == currentMode) return
         keepAliveArmed = true
+        armedKeepAliveMode = currentMode
 
         serviceScope.launch {
             val prefs = userPreferences.preferences.first()
 
-            // 根据保活模式设置不同的间隔
-            val keepAliveInterval = when (prefs.keepAliveMode) {
-                0 -> 30 * 60 * 1000L // 省电模式: 30分钟
-                2 -> 5 * 60 * 1000L  // 可靠模式: 5分钟
-                else -> 15 * 60 * 1000L // 平衡模式: 15分钟(默认)
-            }
+            // 间隔由模式统一决定（KeepAlivePolicy 是唯一出处，有单测）
+            val keepAliveInterval = KeepAlivePolicy.keepAliveIntervalMs(prefs.keepAliveMode)
 
             Log.i(TAG, "❤️ 保活模式: ${prefs.keepAliveMode}, 间隔: ${keepAliveInterval / 1000}秒")
+
+            // 「不保活」模式：撤销一切主动续命手段，并且不再排新的。
+            // 注意顺序 —— 唤醒锁照常持有（它是"运行期间能收到请求"的前提，
+            // 与"是否自动复活"是两件事），因此这里先获取唤醒锁，再处理保活链。
+            acquireKeepAwakeLock()
+
+            if (!KeepAlivePolicy.shouldArmKeepAlive(prefs.keepAliveMode)) {
+                // 仅"不再排新的"不够：闹钟链是自我续期的，已经排上的那一环到点照样会把
+                // 服务拉起来。WorkManager 那条周期任务同理。必须就地取消。
+                KeepAliveManager.cancelKeepAliveAlarm(this@UnlockListenerService)
+                cancelKeepAliveWork()
+                Log.i(
+                    TAG,
+                    "不保活模式：已取消保活闹钟与 WorkManager，清掉最近任务后不会自动恢复"
+                )
+                return@launch
+            }
 
             // 把用户选择的间隔持久化下来：KeepAliveReceiver / KeepAliveWorker 续期时
             // 必须用同一个值。否则第一跳之后它们各自用写死的 5 分钟续期，
@@ -641,7 +688,7 @@ class UnlockListenerService : Service() {
             // 也就是说在那类 ROM 上，唤醒锁是被冻结的结果、而不是它的对手；
             // 必须让用户在系统里把本应用加入「自启动 / 后台运行」白名单才会解冻。
             // 详见 README「息屏无法解锁」一节。
-            acquireKeepAwakeLock()
+            // （唤醒锁已在上方获取；这里保留注释说明它为何与保活模式无关。）
 
             // 1. AlarmManager（主要保活手段）
             try {
@@ -705,6 +752,20 @@ class UnlockListenerService : Service() {
             } catch (e: Exception) {
                 Log.e(TAG, "启动WorkManager心跳保活失败", e)
             }
+        }
+    }
+
+    /**
+     * 取消保活周期任务（切到「不保活」模式时调用）。
+     *
+     * 与闹钟同理：只"不再入队"不够，已经排上的那条周期任务还会到点把服务拉起来。
+     * 用的是同一个唯一任务名，因此不会误伤别的任务。
+     */
+    private fun cancelKeepAliveWork() {
+        try {
+            WorkManager.getInstance(applicationContext).cancelUniqueWork(KEEP_ALIVE_WORK_TAG)
+        } catch (e: Exception) {
+            Log.w(TAG, "取消保活周期任务失败", e)
         }
     }
 

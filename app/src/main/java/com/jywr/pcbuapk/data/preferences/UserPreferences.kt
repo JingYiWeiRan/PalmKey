@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import com.jywr.pcbuapk.service.KeepAlivePolicy
+import com.jywr.pcbuapk.utils.KeepAliveManager
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -61,11 +63,28 @@ class UserPreferences(private val context: Context) {
     
     /**
      * 更新保活模式
-     * @param mode 0=省电, 1=平衡, 2=可靠
+     * @param mode 0=省电, 1=平衡, 2=可靠, 3=不保活（不做任何主动续命，清掉即彻底停止）
      */
     suspend fun setKeepAliveMode(mode: Int) {
+        // 上界是 3：新增了「不保活」模式。若仍按旧的 0..2 收敛，用户选它会被悄悄改成 2。
+        val safeMode = mode.coerceIn(0, 3)
         context.dataStore.edit { prefs ->
-            prefs[KEEP_ALIVE_MODE] = mode.coerceIn(0, 2)
+            prefs[KEEP_ALIVE_MODE] = safeMode
+        }
+
+        // 同步写一份镜像到 SharedPreferences。
+        // 为什么需要镜像：服务的 onStartCommand（决定 START_STICKY）与 onTaskRemoved
+        // （决定划掉任务后是否停服）、以及 BootReceiver 都必须**同步**读到模式，
+        // 而 DataStore 只能异步读。这里是"模式"唯一会被用户改动的地方，所以在此同步。
+        // 详见 KeepAliveManager.getKeepAliveMode。
+        KeepAliveManager.setKeepAliveMode(context, safeMode)
+
+        // 切到「不保活」时必须**当场**撤销已经排上的续命链（闹钟 + WorkManager）。
+        // 不能只依赖服务启动时的判断：startKeepAlive() 每个服务实例只跑一次，
+        // 用户改模式时它不会再执行，那条会自我续期的闹钟会继续把服务拉起来 ——
+        // 与「清掉就死透」直接冲突。真机上验证过这个缺口。
+        if (!KeepAlivePolicy.shouldArmKeepAlive(safeMode)) {
+            KeepAliveManager.stopKeepAlive(context)
         }
     }
 }
@@ -76,5 +95,5 @@ class UserPreferences(private val context: Context) {
 data class UserPreferencesData(
     val notificationModeA: Boolean,
     val udpListenPort: Int,
-    val keepAliveMode: Int // 0=省电, 1=平衡, 2=可靠
+    val keepAliveMode: Int // 0=省电, 1=平衡, 2=可靠, 3=不保活
 )

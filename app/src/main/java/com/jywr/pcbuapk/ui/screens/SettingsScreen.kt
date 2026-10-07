@@ -2,6 +2,8 @@ package com.jywr.pcbuapk.ui.screens
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.jywr.pcbuapk.service.KeepAlivePolicy
 import com.jywr.pcbuapk.ui.viewmodel.SettingsViewModel
 import com.jywr.pcbuapk.utils.KeepAliveManager
 import kotlinx.coroutines.delay
@@ -38,7 +41,10 @@ import kotlinx.coroutines.delay
  * - 列表项之间用 HorizontalDivider 的分隔线，且线色用 outlineVariant，比默认更淡，
  *   不至于把卡片切碎。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+/** 「不保活」模式的取值（见 [KeepAlivePolicy]）。本文件多处依赖它做分支与配色。 */
+private val NO_KEEP_ALIVE_MODE = KeepAlivePolicy.MODE_NO_KEEP_ALIVE
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
@@ -126,38 +132,53 @@ fun SettingsScreen(
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        // 三种模式只影响「多久自检/重启一次服务」。
+                        // 四种模式的语义见 KeepAlivePolicy：前三者只影响「多久自检一次」，
+                        // 「不保活」关掉一切自动复活。
                         //
                         // 旧文案写「省电模式…息屏可能收不到请求」——那是当时的真实行为
                         // （省电模式会放弃常驻唤醒锁），但也正是「选了省电模式就再也解不开
                         // 电脑」这个坑的来源。唤醒锁现在无条件持有，所以不再与模式联动。
-                        //
-                        // 同时也不能反过来声称「息屏解锁不受影响」：实测本机（vivo /
-                        // Android 15）屏幕一熄系统就冻结进程，那是「自启动 / 后台运行」
-                        // 那一项决定的。这里如实说明各自的归属。
                         text = when (preferences.keepAliveMode) {
                             0 -> "省电模式：30 分钟自检一次（最省电，被系统回收后恢复最慢）"
                             2 -> "可靠模式：5 分钟自检一次（最不容易被系统回收）"
+                            3 -> "不保活：划掉最近任务即彻底停止；清掉后台后不会自动恢复，" +
+                                    "需要手动打开本应用才能再次使用"
                             else -> "平衡模式：15 分钟自检一次（推荐）"
                         },
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        text = "以上仅影响自检频率；息屏能否收到解锁请求由下面的「自启动 / 后台运行」决定。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(0 to "省电", 1 to "平衡", 2 to "可靠").forEach { (mode, label) ->
-                            FilterChip(
-                                selected = preferences.keepAliveMode == mode,
-                                onClick = { viewModel.setKeepAliveMode(mode) },
-                                label = { Text(label) }
-                            )
+                        color = if (preferences.keepAliveMode == NO_KEEP_ALIVE_MODE) {
+                            // 这是一项行为差异很大的设置，用主色让它更容易被看见
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
                         }
+                    )
+                    // 这句只对"保活模式"成立；不保活模式下 App 被清掉就不在了，
+                    // 与那项权限无关，所以那种情况不显示，免得误导。
+                    if (preferences.keepAliveMode != NO_KEEP_ALIVE_MODE) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "以上仅影响自检频率；息屏能否收到解锁请求由下面的「自启动 / 后台运行」决定。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    // 用 FlowRow 而不是 Row：第 4 个 chip 加进来后，
+                    // 四枚 chip 在窄屏上会正好顶到可用宽度上限（本屏可用宽度约 screenWidth-64dp），
+                    // 用 Row 会挤压或裁切；FlowRow 会自动换行。
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        listOf(0 to "省电", 1 to "平衡", 2 to "可靠", 3 to "不保活")
+                            .forEach { (mode, label) ->
+                                FilterChip(
+                                    selected = preferences.keepAliveMode == mode,
+                                    onClick = { viewModel.setKeepAliveMode(mode) },
+                                    label = { Text(label) }
+                                )
+                            }
                     }
                 }
 
