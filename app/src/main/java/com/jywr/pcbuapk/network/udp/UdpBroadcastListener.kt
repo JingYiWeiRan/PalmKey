@@ -56,11 +56,26 @@ class UdpBroadcastListener {
      *
      * @return 是否成功进入监听状态
      */
+    /**
+     * 开始监听 UDP 广播
+     *
+     * 绑定在方法内同步完成，因此返回值能真实反映结果：
+     * 之前实现是「先启动协程再置标志」，绑定失败时调用方仍以为监听成功，导致永久不再重试。
+     *
+     * 加 `@Synchronized` + 先释放旧 socket：即使上层并发调用，也只会有唯一一个监听 socket。
+     *
+     * @param onStoppedUnexpectedly 接收循环**非正常**退出时回调。
+     *   这是必须的：socket 还绑在端口上、却已经没人在读，是应用最隐蔽的失效形态 ——
+     *   报文会在内核队列里静默堆积，日志上一条都没有，用户只看到「完全没反应」。
+     *   回调让上层能复位自己的状态位，从而在下次网络变化/服务重启时重建监听。
+     * @return 是否成功进入监听状态
+     */
     @Synchronized
     fun startListening(
         context: Context,
         port: Int,
-        onDeviceFound: (UdpBroadcastData) -> Unit
+        onDeviceFound: (UdpBroadcastData) -> Unit,
+        onStoppedUnexpectedly: () -> Unit = {}
     ): Boolean {
         if (isListening) {
             Log.w(TAG, "已经在监听中")
@@ -90,7 +105,9 @@ class UdpBroadcastListener {
             }.onFailure { Log.w(TAG, "申请 MulticastLock 失败", it) }.getOrNull()
 
             isListening = true
-            listenerJob = scope.launch { receiveLoop(udpSocket, onDeviceFound) }
+            listenerJob = scope.launch {
+                receiveLoop(udpSocket, onDeviceFound, onStoppedUnexpectedly)
+            }
 
             Log.i(TAG, "UDP 监听已启动，端口: $port")
             true
@@ -103,7 +120,8 @@ class UdpBroadcastListener {
 
     private suspend fun receiveLoop(
         udpSocket: DatagramSocket,
-        onDeviceFound: (UdpBroadcastData) -> Unit
+        onDeviceFound: (UdpBroadcastData) -> Unit,
+        onStoppedUnexpectedly: () -> Unit
     ) {
         val buffer = ByteArray(BUFFER_SIZE)
         while (isListening) {
@@ -112,9 +130,18 @@ class UdpBroadcastListener {
                 udpSocket.receive(packet)
 
                 val data = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                Log.i(TAG, "收到 UDP 广播: $data")
+                val sender = packet.address?.hostAddress
+                Log.i(TAG, "收到 UDP 广播: $data（来源=$sender）")
 
-                parseBroadcastData(data)?.let { onDeviceFound(it) }
+                parseBroadcastData(data)?.let { parsed ->
+                    // 载荷是明文 JSON 且无签名，这里至少核对「自称的 pcbuIP」与真实来源
+                    // 是否一致，挡掉从别处转发、伪造来源的广播（否则任何主机都能让手机亮屏）
+                    if (!BroadcastSourcePolicy.isSourceConsistent(parsed.pcbuIP, sender)) {
+                        Log.w(TAG, "广播自称 IP=${parsed.pcbuIP} 但实际来源是 $sender，已丢弃")
+                        return@let
+                    }
+                    onDeviceFound(parsed)
+                }
             } catch (e: Exception) {
                 if (isListening) {
                     Log.e(TAG, "接收 UDP 数据包失败", e)
@@ -124,7 +151,20 @@ class UdpBroadcastListener {
         // 走到这里说明监听已停止（正常 stopListening）或 socket 被关闭。
         // 显式打日志：否则一旦循环意外退出，socket 仍然存在，内核里会静默堆积报文，
         // 应用看起来「完全收不到消息」而没有任何线索。
-        Log.w(TAG, "UDP 接收循环已退出")
+        //
+        // 关键补充：光打日志不够，必须**主动释放 socket 并复位状态**。
+        // 否则会留下最隐蔽的失效形态 —— 端口还占着（`ss -unl` 能看到 *:8888）、
+        // 却已经没有线程在读，报文静默丢弃，而调用方的状态位仍显示「正在监听」，
+        // 于是它永远不会重建监听。真机验证时确实撞到过这个状态。
+        val unexpected = isListening
+        releaseSocket()
+        isListening = false
+        listenerJob = null
+
+        if (unexpected) {
+            Log.w(TAG, "UDP 接收循环非正常退出，已释放 socket 并通知上层重建监听")
+            onStoppedUnexpectedly()
+        }
     }
 
     /**

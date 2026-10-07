@@ -15,8 +15,8 @@ import com.jywr.pcbuapk.utils.KeepAliveManager
  * 通过 AlarmManager 定时触发，检查并重启服务
  *
  * 多层防御策略：
- * 1. AlarmManager 唤醒闹钟（5 分钟链式）- 主要保活手段
- * 2. WorkManager 周期性任务（15 分钟）- 备用保活
+ * 1. AlarmManager 唤醒闹钟（链式，间隔跟随用户在设置里选择的保活模式）- 主要保活手段
+ * 2. WorkManager 周期性任务（15 分钟，平台下限）- 备用保活
  * 3. 服务 START_STICKY 自启动 - 服务被杀死时由系统重建
  */
 class KeepAliveReceiver : BroadcastReceiver() {
@@ -32,9 +32,6 @@ class KeepAliveReceiver : BroadcastReceiver() {
          * 否则会各自持有互不相干的闹钟，同一条保活链被重复排期（多次无谓唤醒）。
          */
         const val REQUEST_CODE_KEEP_ALIVE = 0
-
-        // 快速保活间隔（5分钟）
-        private const val FAST_KEEP_ALIVE_INTERVAL = 5 * 60 * 1000L
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -71,7 +68,10 @@ class KeepAliveReceiver : BroadcastReceiver() {
     }
 
     /**
-     * 设置下一个快速闹钟（5分钟后）
+     * 设置下一个唤醒闹钟，形成链式保活。
+     *
+     * 间隔从 [KeepAliveManager.getKeepAliveInterval] 读取（服务武装时写入的用户选择），
+     * 不再写死：否则用户选的「省电模式 30 分钟」在第一跳之后就会被无声降级成 5 分钟。
      *
      * 由 KeepAliveManager 统一判断精确闹钟是否可用并降级。
      * 之前直接调用 setExactAndAllowWhileIdle，在 Android 13+ 未授予
@@ -79,6 +79,8 @@ class KeepAliveReceiver : BroadcastReceiver() {
      */
     private fun setupNextFastAlarm(context: Context) {
         try {
+            val interval = KeepAliveManager.getKeepAliveInterval(context)
+
             val intent = Intent(context, KeepAliveReceiver::class.java).apply {
                 action = ACTION_KEEP_ALIVE
             }
@@ -91,14 +93,16 @@ class KeepAliveReceiver : BroadcastReceiver() {
 
             val usedExact = KeepAliveManager.scheduleWakeup(
                 context,
-                System.currentTimeMillis() + FAST_KEEP_ALIVE_INTERVAL,
+                System.currentTimeMillis() + interval,
                 pendingIntent
             )
 
+            // 用 Log.i：项目约定 vivo/OPPO 会丢弃三方应用的 DEBUG 级日志，
+            // 而这是保活链路上最关键的一条追踪，降级成 Log.d 就等于在目标机型上看不见。
             if (usedExact) {
-                Log.d(TAG, "⏰ 下一个快速闹钟已设置（${FAST_KEEP_ALIVE_INTERVAL / 1000}秒后，精确）")
+                Log.i(TAG, "⏰ 下一个保活闹钟已设置（${interval / 1000}秒后，精确）")
             } else {
-                Log.d(TAG, "⏰ 下一个保活闹钟已设置（${FAST_KEEP_ALIVE_INTERVAL / 1000}秒后，已降级）")
+                Log.i(TAG, "⏰ 下一个保活闹钟已设置（${interval / 1000}秒后，已降级为非精确）")
             }
         } catch (e: Exception) {
             Log.e(TAG, "❌ 设置闹钟失败", e)

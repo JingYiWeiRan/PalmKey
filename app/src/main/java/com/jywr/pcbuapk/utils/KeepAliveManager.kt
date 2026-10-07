@@ -25,6 +25,11 @@ object KeepAliveManager {
     private const val TAG = "KeepAliveManager"
     private const val PREFS_NAME = "pcbu_keepalive"
     private const val KEY_GUIDE_SHOWN = "keepalive_guide_shown_v1"
+    private const val KEY_KEEP_ALIVE_INTERVAL = "keepalive_interval_ms"
+    private const val KEY_ROM_PERMISSION_PREFIX = "rom_permission_confirmed_"
+
+    /** 保活间隔默认值：15 分钟（与「平衡模式」一致） */
+    const val DEFAULT_KEEP_ALIVE_INTERVAL_MS = 15 * 60 * 1000L
 
     // ---------------------------------------------------------------- 电池优化白名单
 
@@ -37,23 +42,22 @@ object KeepAliveManager {
         }
     }
 
-    fun requestIgnoreBatteryOptimizations(context: Context) {
-        if (isIgnoringBatteryOptimizations(context)) {
-            Log.d(TAG, "已在电池优化白名单中")
-            return
-        }
+    /**
+     * 打开系统「电池优化」列表页，由用户自行把本应用设为「不优化」。
+     *
+     * 为什么不用 `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 那个「一键加白」弹窗：
+     * 它需要 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 权限，而 Google Play 对该权限的
+     * 用途有明确限制（闹钟 / VoIP / companion 设备等特定类别），指纹解锁工具申请它
+     * 属于典型驳回理由。
+     * `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS` 是普通设置页：无需权限、无政策风险，
+     * 代价只是用户多一次点击。
+     */
+    fun openBatteryOptimizationSettings(context: Context) {
         startSafely(
             context,
-            Intent().apply {
-                action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                data = Uri.parse("package:${context.packageName}")
-            },
-            "电池优化白名单"
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
+            "电池优化设置"
         )
-    }
-
-    fun openBatteryOptimizationSettings(context: Context) {
-        startSafely(context, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS), "电池优化设置")
     }
 
     // ---------------------------------------------------------------- 精确闹钟
@@ -236,6 +240,54 @@ object KeepAliveManager {
         }
 
         startSafely(context, intent, "后台弹出界面设置 ($manufacturer)")
+    }
+
+    // ---------------------------------------------------------------- 保活间隔
+    //
+    // 保活链是由三处协同接力的（服务首次武装 → KeepAliveReceiver 续期 → KeepAliveWorker 续期），
+    // 它们必须用**同一个**间隔。服务把用户选的间隔写在这里，续期方读它。
+    //
+    // 早先续期方各自写死 5 分钟，于是用户选的「省电模式 30 分钟」在第一跳之后就
+    // 被无声地降级成 5 分钟 —— 设置项形同虚设，还额外耗电。
+
+    /** 记录本次保活链使用的间隔（毫秒），由 UnlockListenerService 在武装时写入。 */
+    fun setKeepAliveInterval(context: Context, intervalMs: Long) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(KEY_KEEP_ALIVE_INTERVAL, intervalMs)
+            .apply()
+    }
+
+    /** 读取保活链应使用的间隔（毫秒）；未设置过时回退到 [DEFAULT_KEEP_ALIVE_INTERVAL_MS]。 */
+    fun getKeepAliveInterval(context: Context): Long {
+        val interval = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getLong(KEY_KEEP_ALIVE_INTERVAL, DEFAULT_KEEP_ALIVE_INTERVAL_MS)
+        // 防御历史/异常数据：间隔必须为正，否则闹钟会以过去时间触发形成忙循环
+        return if (interval > 0) interval else DEFAULT_KEEP_ALIVE_INTERVAL_MS
+    }
+
+    // ---------------------------------------------------------------- 无法查询的 ROM 权限
+    //
+    // 「后台弹出界面 / 锁屏显示」「自启动 / 后台运行」是国产 ROM 的私有开关，
+    // **没有任何公开 API 可以查询**。此前界面固定传 granted = null，于是无论用户开没开，
+    // 那一行永远显示成「需要开启」，用户看到的就是"我明明开了，它还说没开"。
+    // 既然查不到，就把状态交给用户自己确认（并持久化），界面据此显示「已确认」。
+
+    /** 手动确认项：后台弹出界面 / 锁屏显示 */
+    const val ROM_PERM_BACKGROUND_POPUP = "background_popup"
+
+    /** 手动确认项：自启动 / 后台运行 */
+    const val ROM_PERM_AUTOSTART = "autostart"
+
+    fun isRomPermissionConfirmed(context: Context, key: String): Boolean =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_ROM_PERMISSION_PREFIX + key, false)
+
+    fun setRomPermissionConfirmed(context: Context, key: String, confirmed: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ROM_PERMISSION_PREFIX + key, confirmed)
+            .apply()
     }
 
     // ---------------------------------------------------------------- 首次引导标记

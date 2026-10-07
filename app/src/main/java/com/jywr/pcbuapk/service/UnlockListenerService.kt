@@ -26,12 +26,14 @@ import com.jywr.pcbuapk.MainActivity
 import com.jywr.pcbuapk.R
 import com.jywr.pcbuapk.data.dao.PairedDeviceDao
 import com.jywr.pcbuapk.data.entity.PairedDeviceEntity
+import com.jywr.pcbuapk.data.entity.PairingMethods
 import com.jywr.pcbuapk.data.preferences.UserPreferences
 import com.jywr.pcbuapk.network.bluetooth.BluetoothServer
+import com.jywr.pcbuapk.network.protocol.UnlockProtocol
+import com.jywr.pcbuapk.network.udp.BroadcastSourcePolicy
 import com.jywr.pcbuapk.network.udp.UdpBroadcastData
 import com.jywr.pcbuapk.network.udp.UdpBroadcastListener
 import com.jywr.pcbuapk.receiver.KeepAliveReceiver
-import com.jywr.pcbuapk.utils.CryptoUtils
 import com.jywr.pcbuapk.utils.KeepAliveManager
 import com.jywr.pcbuapk.utils.NotificationManager
 import com.jywr.pcbuapk.worker.KeepAliveWorker
@@ -46,7 +48,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
@@ -77,12 +78,21 @@ class UnlockListenerService : Service() {
         private const val TAG = "UnlockListenerService"
 
         /** 常驻服务通知渠道：低优先级、静默、锁屏不可见 */
-        private const val CHANNEL_ID_SERVICE = "pcbu_service"
+        const val CHANNEL_ID_SERVICE = "pcbu_service"
 
         /** 解锁请求渠道：必须高优先级，否则锁屏下无声、不震动、不可见 */
-        private const val CHANNEL_ID_UNLOCK = "pcbu_unlock_request"
+        const val CHANNEL_ID_UNLOCK = "pcbu_unlock_request"
 
         private const val NOTIFICATION_ID_FOREGROUND = 100
+
+        /**
+         * 保活周期任务的 tag 与唯一任务名。
+         *
+         * 二者必须共用同一个常量：清理（`cancelAllWorkByTag`）、去重入队
+         * （`enqueueUniquePeriodicWork`）与打标（`addTag`）三处一旦写岔，
+         * 清理就会变成空操作 —— 这正是早先 tag 写成 `"keep_alive"` 时发生的事。
+         */
+        const val KEEP_ALIVE_WORK_TAG = "pcbu_keep_alive"
 
         /** 解锁请求通知 ID；MainActivity 接住请求后需要撤销它，所以对外公开 */
         const val NOTIFICATION_ID_UNLOCK_REQUEST = 101
@@ -99,8 +109,13 @@ class UnlockListenerService : Service() {
         /** 降级发通知后的二次回读时间：应用冷启动较慢时避免留下多余横幅 */
         private const val FALLBACK_RECHECK_DELAY_MS = 1500L
 
-        /** 锁屏场景下等待用户完成系统解锁的最长时间，超时即放弃本次请求 */
-        private const val KEYGUARD_WAIT_TIMEOUT_MS = 60_000L
+        /**
+         * 锁屏场景下等待用户完成系统解锁的最长时间，超时即放弃本次请求。
+         *
+         * 直接取自 [UnlockAuthorizationPolicy]：这样「等多久」与「多久之内允许跳过本机指纹」
+         * 必然是同一个值，不会各自漂移。
+         */
+        private val KEYGUARD_WAIT_TIMEOUT_MS = UnlockAuthorizationPolicy.KEYGUARD_WAIT_TIMEOUT_MS
 
         /** 锁屏时仅用于「点亮屏幕」的唤醒锁时长（用户不接管即自动释放） */
         private const val SCREEN_WAKE_TIMEOUT_MS = 10_000L
@@ -123,8 +138,12 @@ class UnlockListenerService : Service() {
          * PC 端是周期广播（约 2 秒一次），窗口内同一台设备的重复请求一定来自重复投递，
          * 而不是两次真实意图。不去重时第二个验证框会把第一个顶掉，
          * 用户看到的是「指纹框闪一下就消失 / 完全没有反应」。
+         *
+         * ⚠️ 该窗口**必须大于** PC 的广播周期（约 2 秒），否则跨广播周期根本不会去重：
+         * 每 2 秒就会投递一个新的解锁请求并取消正在进行的指纹框，
+         * 上面描述的症状实际上并未被修好。早先取 800ms，小于广播周期，正是这个情况。
          */
-        private const val DUPLICATE_REQUEST_WINDOW_MS = 800L
+        private const val DUPLICATE_REQUEST_WINDOW_MS = 3_000L
 
         /** 投递模式：正常弹出指纹识别 */
         const val MODE_PROMPT = 0
@@ -239,8 +258,41 @@ class UnlockListenerService : Service() {
     @Volatile
     private var keepAliveArmed = false
 
-    /** 等待系统解锁的待处理请求（用引用相等区分每一次请求） */
-    private class KeyguardPending(val deviceId: String, val deviceName: String)
+    /**
+     * 已被证明「连不上」的设备 ID（端点可疑）。
+     *
+     * 只有在这个集合里的设备，才允许用 UDP 广播里的端点改写配对记录。
+     * 广播无签名、同网段任何主机都能伪造，若无条件采纳，任何人都能把一个**本来可用**
+     * 的配对静默改指到别处（响应发给攻击者、真电脑收不到 = 莫名其妙的拒绝服务）。
+     * 证据只来自一次真实的连接失败，见 [UnlockService.unlockViaTcp]。
+     *
+     * 仅存在内存里：服务重启会丢失，但那时下次解锁会再次连接失败并重新置位，
+     * 因此没有持久化的必要（也避免为此加一次数据库迁移）。
+     */
+    private val endpointSuspectDeviceIds: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * 标记某设备的已存端点"可疑"（连接失败），允许后续广播改写它。
+     * 由 [UnlockService] 在 TCP 连接失败时调用。
+     */
+    fun markEndpointSuspect(deviceId: String) {
+        if (endpointSuspectDeviceIds.add(deviceId)) {
+            Log.i(TAG, "已存端点连接失败，标记为可疑以允许广播改写: $deviceId")
+        }
+    }
+
+    /**
+     * 等待系统解锁的待处理请求（用引用相等区分每一次请求）。
+     *
+     * [requestedAt] 用于判定「用户解锁手机」是否仍可算作**本次**请求的授权：
+     * 只在 [UnlockAuthorizationPolicy.KEYGUARD_WAIT_TIMEOUT_MS] 窗口内才允许跳过本机指纹。
+     */
+    private class KeyguardPending(
+        val deviceId: String,
+        val deviceName: String,
+        val requestedAt: Long
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -298,6 +350,34 @@ class UnlockListenerService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         Log.i(TAG, "任务被划掉，服务保持运行并确认监听链路")
+        ensureListenersRunning()
+    }
+
+    /**
+     * 幂等地确认两条监听链路都在运行。
+     *
+     * 两个 start 方法内部都有 CAS 闸门，因此在正常运行时调用它是**无副作用**的；
+     * 而当某条链路已经死掉（闸门被复位）时，它会把链路重建起来。
+     *
+     * 之所以需要这么一个"可以随时调用"的入口：`UdpBroadcastListener` 的接收循环
+     * 一旦非正常退出，socket 会被释放、状态位复位，但**没有任何周期性机制**会去重建它。
+     * 这里给几个高频时机提供一个廉价的兜底调用点：
+     * - 用户划掉最近任务（[onTaskRemoved]）
+     * - 用户解锁手机（[ServiceRestartReceiver] 收到 USER_PRESENT）
+     * - 网络恢复（[registerNetworkCallback] 的 onAvailable）
+     */
+    fun ensureListenersRunning() {
+        // 先做一次**状态自检**，这是让重建真正可达的关键：
+        // 服务以为自己在监听（isUdpListening = true），但监听器自己报告没有在跑 ——
+        // 说明接收循环已经停了。此时若直接调 startUdpListening()，会被 CAS 闸门挡回去，
+        // 应用就永久失聪：端口还占着（`ss -unl` 能看到 *:8888）、报文静默丢弃、
+        // 日志上一条都没有。真机验证时撞到过这种"完全没反应"的状态。
+        if (isUdpListening && !udpListener.isRunning()) {
+            Log.w(TAG, "UDP 监听状态不一致（服务标记在监听、监听器已停止），复位后重建")
+            isUdpListening = false
+            udpStarting.set(false)
+        }
+
         startUdpListening()
         startBluetoothListening()
     }
@@ -401,9 +481,21 @@ class UnlockListenerService : Service() {
                 Log.i(TAG, "启动UDP监听，端口: $udpPort")
 
                 // 绑定在方法内同步完成，返回值即真实结果；失败时释放闸门以便后续重试
-                isUdpListening = udpListener.startListening(applicationContext, udpPort) { broadcastData ->
-                    handleUdpBroadcast(broadcastData)
-                }
+                isUdpListening = udpListener.startListening(
+                    context = applicationContext,
+                    port = udpPort,
+                    onDeviceFound = { broadcastData -> handleUdpBroadcast(broadcastData) },
+                    onStoppedUnexpectedly = {
+                        // 接收循环死了、socket 也已释放：复位闸门与状态位，
+                        // 否则 startUdpListening 会被 CAS 挡住，应用永久失聪。
+                        // 不在这里立刻重试（避免异常路径变成忙循环），
+                        // 交给网络变化回调、保活闹钟重启服务、以及每次手机解锁时的
+                        // ensureListenersRunning() 来重建。
+                        isUdpListening = false
+                        udpStarting.set(false)
+                        Log.w(TAG, "UDP 接收循环意外停止，状态已复位，等待重建")
+                    }
+                )
 
                 if (!isUdpListening) {
                     Log.w(TAG, "UDP 监听未启动成功，将在网络恢复时重试")
@@ -530,14 +622,26 @@ class UnlockListenerService : Service() {
 
             Log.i(TAG, "❤️ 保活模式: ${prefs.keepAliveMode}, 间隔: ${keepAliveInterval / 1000}秒")
 
-            // 常驻唤醒锁：没有它，熄屏后进程会被系统/国产 ROM 冻结，收不到任何解锁请求
-            // （详见 keepAwakeLock 字段说明）。省电模式主动放弃它，
-            // 把「息屏时是否要随时可被唤醒」的选择权交给用户。
-            if (prefs.keepAliveMode == 0) {
-                Log.w(TAG, "省电模式：未持有常驻唤醒锁，息屏后可能无法响应解锁请求")
-            } else {
-                acquireKeepAwakeLock()
-            }
+            // 把用户选择的间隔持久化下来：KeepAliveReceiver / KeepAliveWorker 续期时
+            // 必须用同一个值。否则第一跳之后它们各自用写死的 5 分钟续期，
+            // 用户在设置里选的「省电模式 30 分钟」会被无声忽略。
+            KeepAliveManager.setKeepAliveInterval(this@UnlockListenerService, keepAliveInterval)
+
+            // 常驻唤醒锁：**不是可选的省电开关**，因为它是「息屏时 CPU 仍然运行」的前提。
+            // 在正常行为（AOSP 语义）的机型上，没有它，屏幕一熄 CPU 就进入 suspend，
+            // UDP 接收线程不再被调度，报文只会堆在内核 socket 队列里 ——
+            // 这正是「息屏后怎么都解不开电脑」的常见原因。
+            // 原先按保活模式决定是否持有（省电模式就放弃），等于让一个「省电模式」
+            // 静默关掉产品唯一的功能：不再做这种联动，无条件持有。
+            //
+            // ⚠️ 但它**不能**解决国产 ROM 的冻结：实测（本机 vivo / Android 15）
+            // 屏幕一熄系统就把进程放进 freezer（`cgroup.freeze=1`），
+            // 而 Android 会**强制禁用已冻结进程持有的唤醒锁**
+            // （`dumpsys power` 里显示 `'PcbuApk::ServiceKeepAlive' DISABLED ... mIsFrozen`）。
+            // 也就是说在那类 ROM 上，唤醒锁是被冻结的结果、而不是它的对手；
+            // 必须让用户在系统里把本应用加入「自启动 / 后台运行」白名单才会解冻。
+            // 详见 README「息屏无法解锁」一节。
+            acquireKeepAwakeLock()
 
             // 1. AlarmManager（主要保活手段）
             try {
@@ -565,27 +669,35 @@ class UnlockListenerService : Service() {
 
             // 2. WorkManager（额外保障）
             try {
+                // WorkManager 周期任务的下限是 15 分钟
+                // （PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS）。低于它会被拒绝，
+                // 而这里整段在 try 里、异常只记日志，所以「可靠模式」如果填 10 分钟，
+                // 结果是该模式**完全没有** WorkManager 兜底却又毫无提示。
+                // 更短的间隔由上面的 AlarmManager 链负责。
                 val workInterval = when (prefs.keepAliveMode) {
                     0 -> 30L // 省电模式: 30分钟
-                    2 -> 10L // 可靠模式: 10分钟
-                    else -> 15L // 平衡模式: 15分钟
+                    else -> 15L // 平衡/可靠模式: 15分钟（平台下限，更短由闹钟链承担）
                 }
 
                 val workManager = WorkManager.getInstance(applicationContext)
 
                 // 清理历史版本用 enqueue() 每次启动都新增所堆出来的重复周期任务
                 // （实测堆积了 30+ 个，应用一启动就同时跑，白耗电）
-                workManager.cancelAllWorkByTag("keep_alive")
+                //
+                // ⚠️ tag 必须与下面 addTag 的值一致，否则这句是空操作：
+                // 早先这里写 "keep_alive"、而任务打的是 "pcbu_keep_alive"，
+                // 匹配不到任何任务，历史堆积的重复任务从未被清理掉。
+                workManager.cancelAllWorkByTag(KEEP_ALIVE_WORK_TAG)
 
                 val keepAliveRequest = PeriodicWorkRequestBuilder<KeepAliveWorker>(
                     workInterval, TimeUnit.MINUTES
                 )
-                    .addTag("pcbu_keep_alive")
+                    .addTag(KEEP_ALIVE_WORK_TAG)
                     .build()
 
                 // 必须用唯一任务 + KEEP 策略：否则每次服务启动都会再叠加一个
                 workManager.enqueueUniquePeriodicWork(
-                    "pcbu_keep_alive",
+                    KEEP_ALIVE_WORK_TAG,
                     ExistingPeriodicWorkPolicy.KEEP,
                     keepAliveRequest
                 )
@@ -663,22 +775,15 @@ class UnlockListenerService : Service() {
             val requestJson = String(requestData, Charsets.UTF_8)
             Log.i(TAG, "解锁请求内容: $requestJson")
 
-            val encDataHex = JSONObject(requestJson).optString("encData", "")
-            if (encDataHex.isEmpty()) {
-                Log.w(TAG, "解锁请求中缺少 encData")
+            // 复用与 TCP 完全相同的握手语义：从 PC 下发的请求里取出 **PC 生成** 的 unlockToken
+            // （手机不能自己造 token，上游会做等值校验）
+            val token = UnlockProtocol.extractPcUnlockToken(requestJson, device.encryptionKey.value)
+            if (token == null) {
+                Log.e(TAG, "解析/解密 PC 端解锁请求失败（密钥不匹配或两端时间差超过 2 分钟）")
                 deferred.complete(null)
                 return
             }
 
-            val encDataBytes = CryptoUtils.hexToBytes(encDataHex)
-            val decryptedData = CryptoUtils.decryptAES(encDataBytes, device.encryptionKey)
-            if (decryptedData == null) {
-                Log.e(TAG, "解密 PC 端请求数据失败（密钥不匹配或两端时间差异超过 2 分钟）")
-                deferred.complete(null)
-                return
-            }
-
-            val token = JSONObject(String(decryptedData, Charsets.UTF_8)).optString("unlockToken", "")
             pendingUnlockToken = token
             deferred.complete(token)
             Log.i(TAG, "已取得 PC 端 unlockToken")
@@ -707,6 +812,51 @@ class UnlockListenerService : Service() {
                 }
 
                 Log.i(TAG, "找到匹配设备: ${device.deviceName}")
+
+                // 只有走电脑端 **TCP 解锁服务**的配对才用得到 ipAddress / tcpPort。
+                // 蓝牙配对是靠 MAC 连的，端点对它毫无用处：刷新没有意义，而且会因为
+                // "本地 IP 与广播不同"每 2 秒刷一条警告日志（上游广播周期正好是 2 秒），
+                // 把日志冲得没法看。所以整段刷新逻辑只对 TCP 服务类配对生效。
+                if (PairingMethods.usesTcpServer(device.pairingMethod)) {
+                    // 用广播里的端点刷新记录 —— 但**只在有证据表明旧端点失效之后**。
+                    // 广播无签名、同网段任何主机都能发，若无条件采纳，任何人都能把一个
+                    // 本来可用的配对静默改指到别处（响应发到攻击者、真电脑收不到），
+                    // 用户只会看到"电脑好好的却解不开了"。证据来自一次真实的连接失败，
+                    // 见 UnlockService.unlockViaTcp 里的 markEndpointSuspect。
+                    val suspect = endpointSuspectDeviceIds.contains(device.id)
+                    if (BroadcastSourcePolicy.shouldRefreshEndpoint(
+                            storedIp = device.ipAddress,
+                            storedPort = device.tcpPort,
+                            broadcastIp = broadcastData.pcbuIP,
+                            broadcastPort = broadcastData.pcbuPort,
+                            storedEndpointSuspect = suspect
+                        )
+                    ) {
+                        Log.i(
+                            TAG,
+                            "端点已变化，刷新为 ${broadcastData.pcbuIP}:${broadcastData.pcbuPort}" +
+                                    "（原为 ${device.ipAddress}:${device.tcpPort}，旧端点已失效=$suspect）"
+                        )
+                        pairedDeviceDao.updateEndpoint(
+                            device.id,
+                            broadcastData.pcbuIP,
+                            broadcastData.pcbuPort
+                        )
+                        // 已经换成新端点了，解除可疑标记；若新端点也不行，下次连接失败会再次置位
+                        endpointSuspectDeviceIds.remove(device.id)
+                    } else if (!suspect && !device.ipAddress.isNullOrBlank() &&
+                        (device.ipAddress != broadcastData.pcbuIP || device.tcpPort != broadcastData.pcbuPort)
+                    ) {
+                        // 广播声称的端点与本地记录不同，但没被采纳。
+                        // 这里刻意不猜具体原因（可能是旧端点尚未被证明失效，也可能是新端点
+                        // 是回环地址被策略拒绝）—— 只如实说明"按策略未改写"，避免日志误导。
+                        Log.w(
+                            TAG,
+                            "广播端点 ${broadcastData.pcbuIP}:${broadcastData.pcbuPort} 与本地记录" +
+                                    "(${device.ipAddress}:${device.tcpPort}) 不同，按策略暂不改写"
+                        )
+                    }
+                }
 
                 // 按屏幕状态分流投递
                 deliverUnlockRequest(device.id, device.deviceName)
@@ -811,12 +961,16 @@ class UnlockListenerService : Service() {
             "投递解锁请求: $deviceName ($deviceId) 锁屏中=$keyguardLocked 安全锁屏=$deviceSecure"
         )
 
-        if (keyguardLocked && deviceSecure) {
+        // 授权策略集中在 UnlockAuthorizationPolicy 里（纯函数、有单测），
+        // 这里只做投递。信任模型见该类的 KDoc。
+        if (UnlockAuthorizationPolicy.decideDeliveryMode(keyguardLocked, deviceSecure)
+            == DeliveryMode.WAIT_KEYGUARD
+        ) {
             // 锁屏 + 有密码/指纹：只点亮屏幕，让用户走系统解锁。
             // 用户解锁本身就是一次强身份验证，无需再弹一次指纹。
             // 注意这里**不**拉起自己的界面：MainActivity 带着 showWhenLocked，
             // 盖上去会把系统锁屏挡住，用户就没法输 PIN 了，只能干等。
-            val pending = KeyguardPending(deviceId, deviceName)
+            val pending = KeyguardPending(deviceId, deviceName, System.currentTimeMillis())
             pendingKeyguardRequest = pending
             registerUserPresentReceiver()
             scheduleKeyguardTimeout()
@@ -1115,7 +1269,10 @@ class UnlockListenerService : Service() {
     /**
      * 用户在系统锁屏上完成了身份验证。
      *
-     * 这一次系统解锁就是「用户本人」的证明，直接放行，不再要求第二次指纹。
+     * 这一次系统解锁就是「用户本人」的证明，因此不再要求第二次指纹 —— 但**仅限**
+     * 本次请求的等待窗口内（[UnlockAuthorizationPolicy.canSkipLocalBiometric]）。
+     * 超出窗口说明这次「解锁手机」与本次请求已失去关联（例如状态被延迟的事件唤醒），
+     * 此时回退到正常的指纹验证，而不是无条件放行。
      */
     private fun onUserPresent() {
         val pending = pendingKeyguardRequest ?: return
@@ -1126,8 +1283,20 @@ class UnlockListenerService : Service() {
         releaseScreenWakeLock()
         NotificationManagerCompat.from(this).cancel(NOTIFICATION_ID_UNLOCK_WAITING)
 
-        Log.i(TAG, "✅ 用户已完成系统解锁，直接放行: ${pending.deviceName}")
-        pushUnlockToUi(pending.deviceId, pending.deviceName, MODE_SKIP_BIOMETRIC)
+        val requestAgeMs = System.currentTimeMillis() - pending.requestedAt
+        val mode = if (UnlockAuthorizationPolicy.canSkipLocalBiometric(requestAgeMs)) {
+            Log.i(TAG, "✅ 用户已完成系统解锁（${requestAgeMs}ms），按策略跳过本机指纹: ${pending.deviceName}")
+            MODE_SKIP_BIOMETRIC
+        } else {
+            Log.w(
+                TAG,
+                "⚠️ 系统解锁事件距请求已 ${requestAgeMs}ms，超出授权窗口，" +
+                        "回退为指纹验证: ${pending.deviceName}"
+            )
+            MODE_PROMPT
+        }
+
+        pushUnlockToUi(pending.deviceId, pending.deviceName, mode)
     }
 
     /**
@@ -1169,51 +1338,47 @@ class UnlockListenerService : Service() {
     /**
      * 发送蓝牙解锁响应给PC端
      *
-     * @param unlockToken 生物识别生成的令牌（不使用）
      * @param device 配对的设备信息
-     * @note 必须返回PC端发送的unlockToken，否则PC端验证会失败
+     * @return null 表示发送成功；否则是失败原因，供界面层如实提示用户
+     * @note 必须回显PC端下发的unlockToken，否则PC端验证会失败
+     *
+     * 为什么要返回结果：早先本方法把**所有**失败都吞在内部只记日志、返回 Unit，
+     * 调用方于是无论实际成败都向用户报「解锁成功」——用户看到成功、
+     * 电脑却毫无反应，而且没有任何可供自查的线索。
      */
-    suspend fun sendBluetoothResponse(unlockToken: String, device: PairedDeviceEntity) {
-        try {
+    suspend fun sendBluetoothResponse(device: PairedDeviceEntity): String? {
+        return try {
             // 关键：必须使用PC端发送的unlockToken，否则PC端验证会失败
             var tokenToReturn = pendingUnlockToken
             if (tokenToReturn.isNullOrEmpty()) {
                 // 用户可能比读包更快完成验证，这里短暂等待读包结果
                 tokenToReturn = withTimeoutOrNull(TOKEN_WAIT_TIMEOUT_MS) { tokenDeferred?.await() }
             }
-            val finalToken = tokenToReturn ?: ""
-            if (finalToken.isEmpty()) {
-                Log.e(TAG, "警告：PC端unlockToken为空，PC端验证将失败")
+            val finalToken = tokenToReturn
+            if (finalToken.isNullOrEmpty()) {
+                Log.e(TAG, "PC端unlockToken为空，无法回发有效响应")
+                return "未取得电脑端的解锁令牌，请重试"
             }
 
             Log.i(TAG, "发送蓝牙解锁响应，设备: ${device.deviceName}")
 
-            // 构建响应数据（PacketUnlockResponseData）
-            val responseData = JSONObject().apply {
-                put("unlockToken", finalToken)
-                put("passwordKey", device.passwordKey ?: "")
-            }
+            // 与 TCP 链路复用同一套响应构建逻辑（PacketUnlockResponse）
+            val responseJson = UnlockProtocol.buildUnlockResponse(
+                pcUnlockToken = finalToken,
+                passwordKey = device.passwordKey?.value,
+                encryptionKey = device.encryptionKey.value
+            ) ?: return "加密解锁响应失败"
 
-            // 加密响应数据
-            val encryptedData = CryptoUtils.encryptAES(
-                responseData.toString().toByteArray(Charsets.UTF_8),
-                device.encryptionKey
-            ) ?: throw Exception("加密响应数据失败")
-
-            // 构建完整的响应JSON（PacketUnlockResponse）
-            val responseJson = JSONObject().apply {
-                put("error", "") // 空表示成功
-                put("encData", CryptoUtils.bytesToHex(encryptedData))
-            }
-
-            val success = bluetoothServer.sendUnlockResponsePacket(responseJson.toString())
-            if (success) {
+            if (bluetoothServer.sendUnlockResponsePacket(responseJson)) {
                 Log.i(TAG, "✅ 蓝牙解锁响应Packet已发送")
+                null
             } else {
                 Log.e(TAG, "❌ 发送蓝牙响应Packet失败")
+                "发送解锁响应失败，请确认与电脑的蓝牙连接仍然有效"
             }
         } catch (e: Exception) {
             Log.e(TAG, "发送蓝牙响应异常", e)
+            "蓝牙解锁失败: ${e.message}"
         } finally {
             // 清理待处理状态
             pendingBluetoothDevice = null

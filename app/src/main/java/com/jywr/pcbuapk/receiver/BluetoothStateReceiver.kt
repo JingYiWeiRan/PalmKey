@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.jywr.pcbuapk.service.UnlockListenerService
 
 /**
@@ -42,18 +43,26 @@ class BluetoothStateReceiver : BroadcastReceiver() {
     
     /**
      * 检查服务是否运行，如果未运行则启动
+     *
+     * ⚠️ 必须捕获异常：Android 12+ 从后台启动前台服务会抛
+     * `ForegroundServiceStartNotAllowedException`，而清单注册接收器的 `onReceive`
+     * 一旦抛出未捕获异常就是**进程崩溃**。同仓库的 BootReceiver / KeepAliveReceiver
+     * 都做了同样的保护，这里漏了。
      */
     private fun startUnlockServiceIfNeeded(context: Context) {
-        // 这里可以添加检查服务是否运行的逻辑
-        // 为简单起见，直接尝试启动服务（如果已在运行，startService不会重复创建）
-        val serviceIntent = Intent(context, UnlockListenerService::class.java)
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(serviceIntent)
-        } else {
-            context.startService(serviceIntent)
+        try {
+            val serviceIntent = Intent(context, UnlockListenerService::class.java)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ContextCompat.startForegroundService(context, serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+
+            Log.i(TAG, "已尝试启动解锁监听服务")
+        } catch (e: Exception) {
+            // 系统拒绝后台启动前台服务时忽略即可：服务本来就在运行，或稍后会由闹钟链拉起
+            Log.w(TAG, "启动解锁监听服务被系统拒绝，忽略", e)
         }
-        
-        Log.d(TAG, "已尝试启动解锁监听服务")
     }
 }
