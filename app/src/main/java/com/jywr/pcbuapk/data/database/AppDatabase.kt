@@ -10,8 +10,8 @@ import com.jywr.pcbuapk.data.entity.PairedDeviceEntity
  */
 @Database(
     entities = [PairedDeviceEntity::class],
-    version = 2,
-    exportSchema = false
+    version = 3,
+    exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
     

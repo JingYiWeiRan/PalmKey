@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+   全量备份规则（API ≤ 30 使用；API 31+ 见 data_extraction_rules.xml）。
+
+   为什么必须排除而不是保持默认：
+   `paired_devices` 表里的 `encryptionKey` / `passwordKey` 是**明文存储**的凭据，
+   持有它就能参与电脑端的解锁协议。默认规则（本文件原先是一份全是注释的模板）
+   会把整个数据库纳入云备份与设备迁移，等于让这把钥匙离开本机。
+
+   如果后续给密钥加上了 AndroidKeyStore 包装，这里的排除可以保留：
+   备份出来的密文在别的设备上也解不开，没有必要迁移。
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- 配对设备数据库（含明文 encryptionKey / passwordKey） -->
+    <exclude domain="database" path="." />
+    <!-- DataStore 偏好（目前无密钥，但没有加密包装，不应纳入备份） -->
+    <exclude domain="file" path="datastore" />
+    <!-- 保活引导标记等本机状态，跨设备无意义 -->
+    <exclude domain="sharedpref" path="." />
 </full-backup-content>

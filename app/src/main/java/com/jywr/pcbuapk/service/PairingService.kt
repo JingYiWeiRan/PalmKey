@@ -2,6 +2,7 @@ package com.jywr.pcbuapk.service
 
 import android.util.Log
 import com.jywr.pcbuapk.data.dao.PairedDeviceDao
+import com.jywr.pcbuapk.data.converter.SecretString
 import com.jywr.pcbuapk.data.entity.PairedDeviceEntity
 import com.jywr.pcbuapk.network.protocol.PacketCodec
 import com.jywr.pcbuapk.network.tcp.TcpClient
@@ -123,8 +124,9 @@ class PairingService @Inject constructor(
                     pairingMethod = pairingMethod,
                     userName = userName,
                     passwordEnc = "", // 暂时为空，后续可能需要
-                    encryptionKey = encKey,  // 修复：保存 encKey 用于解锁通信
-                    passwordKey = passwordKey,  // 保存 passwordKey 用于解锁响应
+                    // 用 SecretString 包一层：入库时由 Room TypeConverter 加密（AndroidKeyStore）
+                    encryptionKey = SecretString(encKey),
+                    passwordKey = SecretString(passwordKey),
                     ipAddress = ipAddress,
                     tcpPort = unlockPort,
                     udpPort = udpPort,

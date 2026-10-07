@@ -29,7 +29,24 @@ object AppModule {
             database.execSQL("ALTER TABLE paired_devices ADD COLUMN passwordKey TEXT")
         }
     }
-    
+
+    /**
+     * 数据库迁移：2 -> 3
+     * 为蓝牙设备匹配所依赖的两列补上索引（原先每次蓝牙唤醒都是两次全表扫描）。
+     */
+    private val MIGRATION_2_3 = object : Migration(2, 3) {
+        override fun migrate(database: SupportSQLiteDatabase) {
+            database.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_paired_devices_bluetoothAddress " +
+                        "ON paired_devices(bluetoothAddress)"
+            )
+            database.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_paired_devices_deviceName " +
+                        "ON paired_devices(deviceName)"
+            )
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase {
@@ -37,7 +54,7 @@ object AppModule {
             context,
             AppDatabase::class.java,
             AppDatabase.DATABASE_NAME
-        ).addMigrations(MIGRATION_1_2).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
     }
     
     @Provides
