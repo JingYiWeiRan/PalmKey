@@ -1,5 +1,6 @@
 package com.jywr.pcbuapk.ui.screens
 
+import android.content.Context
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -43,6 +44,21 @@ import kotlinx.coroutines.delay
  */
 /** 「不保活」模式的取值（见 [KeepAlivePolicy]）。本文件多处依赖它做分支与配色。 */
 private val NO_KEEP_ALIVE_MODE = KeepAlivePolicy.MODE_NO_KEEP_ALIVE
+
+/**
+ * 读取本应用的版本名，用于「关于」区显示。
+ *
+ * 不写死字面量：原先那里是 `"版本 1.0.0"`，一发新版本界面就说谎。
+ * 也不用 `BuildConfig.VERSION_NAME`：本工程未开启 buildConfig 生成（AGP 8 默认关闭）。
+ *
+ * 读不到时返回「未知」而不是猜一个值 —— 猜出来的版本号比没有更糟，
+ * 它会让人以为"装的是旧版"，从而在错误的方向上排查。
+ */
+private fun appVersionName(context: Context): String =
+    runCatching {
+        @Suppress("DEPRECATION")
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName
+    }.getOrNull() ?: "未知"
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -291,7 +307,13 @@ fun SettingsScreen(
                     Text("掌钥 · PalmKey", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        text = "版本 1.0.0",
+                        // 从 PackageManager 读，不要写死：
+                        // 原先这里是字面量 "版本 1.0.0"，一发新版本界面就会说谎，
+                        // 而"界面显示 1.0.0、装的其实是 1.0.1"这种不一致会让
+                        // 排查版本相关问题时直接走错方向。
+                        // 用 PackageManager 而不是 BuildConfig.VERSION_NAME：本工程没开
+                        // buildConfig 生成（AGP 8 默认关闭），这样也不引入额外的构建配置。
+                        text = "版本 " + appVersionName(context),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
