@@ -38,6 +38,18 @@ class BluetoothServer {
          * 失效、适配器复位都会走到这里 —— 而这些恰恰是长时间运行后最常见的情况。
          */
         private const val ACCEPT_RETRY_BACKOFF_MS = 500L
+
+        /**
+         * accept 连续失败多少次就判定监听已失效。
+         *
+         * 实测（vivo V2301A / Android 15）关闭蓝牙后 `accept()` 会**持续**抛
+         * `IOException: read failed, socket might closed or timeout`，线程不会自己退出。
+         * 若不主动退出，`isListening` 永远是 true，服务的状态自检就看不到不一致，
+         * 重建永远不会发生 —— 表现为"蓝牙已经开回来，电脑端却再也连不上手机"。
+         *
+         * 3 次 × 500ms ≈ 1.5 秒即判定失效，随后由 ensureListenersRunning() 重建。
+         */
+        private const val ACCEPT_MAX_CONSECUTIVE_FAILURES = 3
     }
     
     private var serverSocket: BluetoothServerSocket? = null
@@ -99,6 +111,9 @@ class BluetoothServer {
                 
                 Log.d(TAG, "✓ Server Socket创建成功，开始监听...")
                 
+                // 连续失败计数：达到阈值即判定监听失效（见 catch 里的说明）
+                var consecutiveFailures = 0
+                
                 while (isListening) {
                     try {
                         // 取出本地引用：stopListening() 会把字段置空，
@@ -112,6 +127,7 @@ class BluetoothServer {
 
                         // 阻塞等待客户端连接
                         val socket = server.accept()
+                        consecutiveFailures = 0
                         
                         if (socket != null) {
                             val device = socket.remoteDevice
@@ -137,15 +153,40 @@ class BluetoothServer {
                         }
                         
                     } catch (e: Exception) {
-                        if (isListening) {
-                            Log.e(TAG, "等待客户端连接失败（${ACCEPT_RETRY_BACKOFF_MS}ms 后重试）", e)
-                            // 退避，避免持续失败时空转刷日志
-                            try {
-                                Thread.sleep(ACCEPT_RETRY_BACKOFF_MS)
-                            } catch (interrupted: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                break
-                            }
+                        if (!isListening) break
+
+                        consecutiveFailures++
+                        // 只在第一次打完整堆栈：重复失败时再打 12 行堆栈就是日志洪水
+                        // （真机实测关一次蓝牙能刷出上百行）
+                        if (consecutiveFailures == 1) {
+                            Log.e(TAG, "等待客户端连接失败，${ACCEPT_RETRY_BACKOFF_MS}ms 后重试", e)
+                        } else {
+                            Log.w(TAG, "等待客户端连接仍失败（第 $consecutiveFailures 次）: ${e.message}")
+                        }
+
+                        // 连续失败 = 这个 serverSocket 已经不可用（蓝牙被关闭、适配器复位、
+                        // RFCOMM 服务记录失效）。实测关闭蓝牙后 accept 会**一直**抛
+                        // IOException，线程不会自己退出 —— 那样 isListening 始终为 true，
+                        // 服务的状态自检看不到不一致，也就永远不会重建：
+                        // 表现为"蓝牙已经开回来了，电脑端却再也连不上手机"。
+                        // 所以这里必须主动判定失效、释放 socket 并退出循环，
+                        // 把重建交给 ensureListenersRunning()（由蓝牙开启广播、
+                        // onStartCommand、保活链等触发）。
+                        if (consecutiveFailures >= ACCEPT_MAX_CONSECUTIVE_FAILURES) {
+                            Log.w(
+                                TAG,
+                                "accept 连续失败 $consecutiveFailures 次，判定监听已失效：释放 socket 并退出，等待重建"
+                            )
+                            releaseServerSocket()
+                            break
+                        }
+
+                        // 退避，避免持续失败时空转刷日志
+                        try {
+                            Thread.sleep(ACCEPT_RETRY_BACKOFF_MS)
+                        } catch (interrupted: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
                         }
                     }
                 }
@@ -178,12 +219,7 @@ class BluetoothServer {
         isListening = false
         
         // 关闭Server Socket
-        try {
-            serverSocket?.close()
-            serverSocket = null
-        } catch (e: Exception) {
-            Log.e(TAG, "关闭Server Socket失败", e)
-        }
+        releaseServerSocket()
         
         // 关闭客户端连接
         closeClientConnection()
@@ -193,6 +229,23 @@ class BluetoothServer {
         listenerThread = null
         
         Log.d(TAG, "蓝牙Server已停止")
+    }
+
+    /**
+     * 释放 Server Socket。
+     *
+     * 两处会调用它：`stopListening()`（用户/服务主动停止）与 accept 线程自身在**连续失败**
+     * 后判定失效时。置空是关键 —— accept 线程每轮都从字段取本地引用，为空即退出循环；
+     * 否则线程会在一个已经死掉的 socket 上反复 accept。
+     */
+    private fun releaseServerSocket() {
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "关闭Server Socket失败", e)
+        } finally {
+            serverSocket = null
+        }
     }
     
     /**
