@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   数据提取规则（API 31+ 使用；API ≤ 30 见 backup_rules.xml）。
+    数据提取规则（API 31+ 使用；API ≤ 30 见 backup_rules.xml）。
 
-   与 backup_rules.xml 保持一致：配对凭据（明文 encryptionKey / passwordKey）
-   以及本机保活状态都不应通过云备份或设备迁移离开本机。
-   TODO 原先是一份全是注释的模板，等于全部纳入备份 —— 已改为显式排除。
+    与 backup_rules.xml 保持一致：配对凭据（现由 AndroidKeyStore 包装的
+    encryptionKey / passwordKey）以及本机保活状态都不应通过云备份或设备迁移离开本机。
+
+    排除的理由（与 backup_rules.xml 中一致）：
+      1. Keystore 密钥随卸载销毁，迁移到别的设备也解不开；
+      2. 数据库里还有设备 ID、蓝牙 MAC、IP 等本机标识；
+      3. 迁移后解不开的密文只会让用户看到"配对还在、但永远解锁失败"的假象。
+
+    TODO 原先是一份全是注释的模板，等于全部纳入备份 —— 已改为显式排除。
 -->
 <data-extraction-rules>
     <cloud-backup>

@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   全量备份规则（API ≤ 30 使用；API 31+ 见 data_extraction_rules.xml）。
+    全量备份规则（API ≤ 30 使用；API 31+ 见 data_extraction_rules.xml）。
 
-   为什么必须排除而不是保持默认：
-   `paired_devices` 表里的 `encryptionKey` / `passwordKey` 是**明文存储**的凭据，
-   持有它就能参与电脑端的解锁协议。默认规则（本文件原先是一份全是注释的模板）
-   会把整个数据库纳入云备份与设备迁移，等于让这把钥匙离开本机。
+    为什么必须排除而不是保持默认：
+    `paired_devices` 表里存着 `encryptionKey` / `passwordKey` —— 持有它就能参与电脑端的
+    解锁协议。默认规则（本文件原先是一份全是注释的模板）会把整个数据库纳入云备份与
+    设备迁移，等于让这把钥匙离开本机。
 
-   如果后续给密钥加上了 AndroidKeyStore 包装，这里的排除可以保留：
-   备份出来的密文在别的设备上也解不开，没有必要迁移。
+    这些凭据现在已由 AndroidKeyStore 包装（AES-256-GCM，见 utils/SecretCipher.kt），
+    但**排除依然必须保留** —— 理由变了，结论不变：
+      1. Keystore 密钥随卸载销毁，迁移到别的设备也解不开，备份这段密文没有意义；
+      2. 数据库里还有设备 ID、蓝牙 MAC、IP 等本机标识，没必要一起带走；
+      3. 迁移后解不开的密文只会让用户看到"配对还在、但永远解锁失败"的假象。
 -->
 <full-backup-content>
-    <!-- 配对设备数据库（含明文 encryptionKey / passwordKey） -->
+    <!-- 配对设备数据库（含 Keystore 包装的 encryptionKey / passwordKey） -->
     <exclude domain="database" path="." />
-    <!-- DataStore 偏好（目前无密钥，但没有加密包装，不应纳入备份） -->
+    <!-- DataStore 偏好（无密钥，但也没有加密包装） -->
     <exclude domain="file" path="datastore" />
-    <!-- 保活引导标记等本机状态，跨设备无意义 -->
+    <!-- 保活模式、无法查询的 ROM 权限确认等本机状态，跨设备无意义 -->
     <exclude domain="sharedpref" path="." />
 </full-backup-content>
